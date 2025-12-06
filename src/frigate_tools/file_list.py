@@ -64,6 +64,7 @@ def parse_skip_days(skip_days: list[str]) -> set[int]:
 
 def parse_skip_hours(skip_hours: list[str]) -> list[HourRange]:
     """Parse hour range strings like '16-8' into HourRange objects."""
+    logger = get_logger()
     result = []
     for range_str in skip_hours:
         if "-" in range_str:
@@ -74,8 +75,23 @@ def parse_skip_hours(skip_hours: list[str]) -> list[HourRange]:
                     end = int(parts[1])
                     if 0 <= start <= 23 and 0 <= end <= 23:
                         result.append(HourRange(start, end))
+                    else:
+                        logger.debug(
+                            "Invalid skip_hours range - hours must be 0-23",
+                            range=range_str,
+                            start=start,
+                            end=end,
+                        )
                 except ValueError:
-                    pass
+                    logger.debug(
+                        "Invalid skip_hours format - could not parse integers",
+                        range=range_str,
+                    )
+        else:
+            logger.debug(
+                "Invalid skip_hours format - expected 'start-end'",
+                range=range_str,
+            )
     return result
 
 
