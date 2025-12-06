@@ -10,10 +10,11 @@ import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
+from frigate_tools.clip import create_clip, create_multi_camera_clip, ClipProgress
 from frigate_tools.file_list import generate_file_lists
 from frigate_tools.grid import calculate_grid_layout, create_grid_video
 from frigate_tools.observability import init_observability, shutdown_observability, get_logger
-from frigate_tools.timelapse import create_timelapse, ProgressInfo
+from frigate_tools.timelapse import create_timelapse, encode_timelapse, ProgressInfo
 
 app = typer.Typer(
     name="frigate-tools",
@@ -289,20 +290,57 @@ def timelapse_create(
             raise typer.Exit(1)
 
     else:
-        # Multi-camera - use grid layout
+        # Multi-camera - use grid layout with two-step approach
         layout = calculate_grid_layout(len(camera_list))
         console.print(f"[dim]Grid layout: {layout.rows}x{layout.cols}[/dim]")
 
-        with console.status("[bold blue]Creating grid timelapse..."):
-            success = create_grid_video(
-                camera_files=file_lists,
-                output_path=output,
-                preset=preset,
-            )
+        # Step 1: Create grid video at full speed to temp file
+        import tempfile
+        temp_dir = Path(tempfile.mkdtemp(prefix="frigate_grid_"))
+        grid_temp = temp_dir / "grid_full_speed.mp4"
 
-        if not success:
-            console.print("[red]Error:[/red] Grid timelapse creation failed")
-            raise typer.Exit(1)
+        try:
+            with console.status("[bold blue]Step 1/2: Creating grid layout..."):
+                success = create_grid_video(
+                    camera_files=file_lists,
+                    output_path=grid_temp,
+                    preset=preset,
+                )
+
+            if not success:
+                console.print("[red]Error:[/red] Grid creation failed")
+                raise typer.Exit(1)
+
+            # Step 2: Apply timelapse encoding to the grid video
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Step 2/2: Encoding timelapse...", total=100)
+
+                def update_progress(info: ProgressInfo) -> None:
+                    if info.percent is not None:
+                        progress.update(task, completed=info.percent)
+
+                success = encode_timelapse(
+                    input_path=grid_temp,
+                    output_path=output,
+                    target_duration=target_duration,
+                    preset=preset,
+                    progress_callback=update_progress,
+                )
+
+            if not success:
+                console.print("[red]Error:[/red] Timelapse encoding failed")
+                raise typer.Exit(1)
+
+        finally:
+            # Clean up temp files
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Report success
     file_size = output.stat().st_size
@@ -310,6 +348,230 @@ def timelapse_create(
     console.print()
     console.print(f"[green]Success![/green] Created {output}")
     console.print(f"  Size: {size_mb:.1f} MB")
+
+
+@clip_app.command("create")
+def clip_create(
+    cameras: Annotated[
+        str,
+        typer.Option(
+            "--cameras", "-c",
+            help="Comma-separated camera names (e.g., bporchcam,frontcam)"
+        ),
+    ],
+    start: Annotated[
+        datetime,
+        typer.Option(
+            "--start", "-s",
+            help="Start time (ISO format: 2025-12-01T12:00)",
+            formats=["%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"],
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output", "-o",
+            help="Output file path (for single camera) or directory (for --separate)",
+        ),
+    ],
+    end: Annotated[
+        Optional[datetime],
+        typer.Option(
+            "--end", "-e",
+            help="End time (ISO format: 2025-12-01T12:05)",
+            formats=["%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"],
+        ),
+    ] = None,
+    duration: Annotated[
+        Optional[str],
+        typer.Option(
+            "--duration", "-d",
+            help="Clip duration as alternative to --end (e.g., 5m, 1h)",
+        ),
+    ] = None,
+    instance: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--instance", "-i",
+            help="Frigate instance path (auto-detected if not specified)",
+        ),
+    ] = None,
+    separate: Annotated[
+        bool,
+        typer.Option(
+            "--separate",
+            help="Create separate files for each camera instead of grid",
+        ),
+    ] = False,
+    reencode: Annotated[
+        bool,
+        typer.Option(
+            "--reencode",
+            help="Re-encode video (slower but better compatibility)",
+        ),
+    ] = False,
+    preset: Annotated[
+        str,
+        typer.Option(
+            "--preset",
+            help="FFmpeg encoding preset (only used with --reencode)",
+        ),
+    ] = "fast",
+) -> None:
+    """Create a clip from Frigate recordings.
+
+    Example (single camera):
+        frigate-tools clip create \\
+            --cameras frontcam \\
+            --start 2025-12-01T12:00 \\
+            --end 2025-12-01T12:05 \\
+            -o clip.mp4
+
+    Example (multiple cameras with grid):
+        frigate-tools clip create \\
+            --cameras bporchcam,frontcam \\
+            --start 2025-12-01T12:00 \\
+            --duration 5m \\
+            -o clip.mp4
+
+    Example (separate files per camera):
+        frigate-tools clip create \\
+            --cameras bporchcam,frontcam \\
+            --start 2025-12-01T12:00 \\
+            --duration 5m \\
+            --separate \\
+            -o output_dir/
+    """
+    logger = get_logger()
+
+    # Validate end time or duration
+    if end is None and duration is None:
+        console.print("[red]Error:[/red] Must specify either --end or --duration")
+        raise typer.Exit(1)
+
+    if end is not None and duration is not None:
+        console.print("[red]Error:[/red] Cannot specify both --end and --duration")
+        raise typer.Exit(1)
+
+    # Calculate end time from duration if needed
+    if duration is not None:
+        try:
+            duration_seconds = parse_duration(duration)
+            from datetime import timedelta
+            end = start + timedelta(seconds=duration_seconds)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1)
+
+    # Parse cameras
+    camera_list = [c.strip() for c in cameras.split(",") if c.strip()]
+    if not camera_list:
+        console.print("[red]Error:[/red] No cameras specified")
+        raise typer.Exit(1)
+
+    # Auto-detect or validate instance path
+    if instance is None:
+        instance = find_frigate_instance()
+        if instance is None:
+            console.print(
+                "[red]Error:[/red] Could not auto-detect Frigate instance. "
+                "Use --instance to specify the path."
+            )
+            raise typer.Exit(1)
+        console.print(f"[dim]Using Frigate instance: {instance}[/dim]")
+
+    if not instance.exists():
+        console.print(f"[red]Error:[/red] Instance path does not exist: {instance}")
+        raise typer.Exit(1)
+
+    # Display info
+    console.print(f"[bold]Creating clip[/bold]")
+    console.print(f"  Cameras: {', '.join(camera_list)}")
+    console.print(f"  Time range: {start} to {end}")
+    if len(camera_list) > 1:
+        console.print(f"  Mode: {'separate files' if separate else 'grid layout'}")
+    if reencode:
+        console.print(f"  Re-encoding: yes (preset: {preset})")
+    console.print()
+
+    # Create clip(s)
+    if len(camera_list) == 1:
+        # Single camera
+        camera = camera_list[0]
+
+        with console.status(f"[bold blue]Creating clip for {camera}..."):
+            success = create_clip(
+                instance_path=instance,
+                camera=camera,
+                start=start,
+                end=end,
+                output_path=output,
+                reencode=reencode,
+                preset=preset,
+            )
+
+        if not success:
+            console.print("[red]Error:[/red] Clip creation failed")
+            raise typer.Exit(1)
+
+        file_size = output.stat().st_size
+        size_mb = file_size / (1024 * 1024)
+        console.print(f"[green]Success![/green] Created {output}")
+        console.print(f"  Size: {size_mb:.1f} MB")
+
+    else:
+        # Multi-camera
+        if separate:
+            # Create output directory if needed
+            output.mkdir(parents=True, exist_ok=True)
+
+            with console.status("[bold blue]Creating clips..."):
+                result = create_multi_camera_clip(
+                    instance_path=instance,
+                    cameras=camera_list,
+                    start=start,
+                    end=end,
+                    output_dir=output,
+                    separate=True,
+                    reencode=reencode,
+                    preset=preset,
+                )
+
+            if result is None:
+                console.print("[red]Error:[/red] Clip creation failed")
+                raise typer.Exit(1)
+
+            console.print(f"[green]Success![/green] Created clips:")
+            for camera, path in result.items():
+                size_mb = path.stat().st_size / (1024 * 1024)
+                console.print(f"  {camera}: {path} ({size_mb:.1f} MB)")
+
+        else:
+            # Grid layout
+            with console.status("[bold blue]Creating grid clip..."):
+                result = create_multi_camera_clip(
+                    instance_path=instance,
+                    cameras=camera_list,
+                    start=start,
+                    end=end,
+                    output_dir=output.parent,
+                    separate=False,
+                    reencode=reencode,
+                    preset=preset,
+                )
+
+            if result is None:
+                console.print("[red]Error:[/red] Grid clip creation failed")
+                raise typer.Exit(1)
+
+            # Move to requested output path if different
+            if isinstance(result, Path) and result != output:
+                result.rename(output)
+
+            file_size = output.stat().st_size
+            size_mb = file_size / (1024 * 1024)
+            console.print(f"[green]Success![/green] Created {output}")
+            console.print(f"  Size: {size_mb:.1f} MB")
 
 
 def main() -> None:
