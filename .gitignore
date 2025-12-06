@@ -45,3 +45,4 @@ Thumbs.db
 
 # Beads database (JSONL is tracked, SQLite is not)
 .beads/beads.db
+test_data/
