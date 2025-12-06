@@ -70,7 +70,7 @@ def detect_hwaccel() -> HWAccel:
             test_result = subprocess.run(
                 [
                     "ffmpeg", "-hide_banner", "-v", "error",
-                    "-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128",
+                    "-vaapi_device", "/dev/dri/renderD128",
                     "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
                     "-vf", "format=nv12,hwupload",
                     "-c:v", "h264_vaapi", "-f", "null", "-"
@@ -228,20 +228,24 @@ def concat_files(
     input_files: list[Path],
     output_path: Path,
     progress_callback: Callable[[ConcatProgress], None] | None = None,
+    batch_size: int = 100,
 ) -> bool:
     """Concatenate video files using ffmpeg concat demuxer.
 
     Uses -c copy for fast concatenation without re-encoding.
+    Processes files in batches to avoid issues with a very large number of files.
 
     Args:
         input_files: List of video files to concatenate
         output_path: Output file path
         progress_callback: Optional callback for progress updates (receives ConcatProgress)
+        batch_size: Number of files to concatenate in each batch.
 
     Returns:
         True if successful, False otherwise
     """
     import time
+    import tempfile
 
     logger = get_logger()
 
@@ -249,81 +253,120 @@ def concat_files(
         logger.error("No input files provided")
         return False
 
-    with traced_operation("concat_files", {"file_count": len(input_files)}):
-        # Calculate total input size for progress estimation
-        total_size = sum(f.stat().st_size for f in input_files if f.exists())
-
-        # Create concat file list
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            concat_file = Path(f.name)
-            for file_path in input_files:
-                # FFmpeg concat requires escaped paths
-                escaped = str(file_path).replace("'", "'\\''")
-                f.write(f"file '{escaped}'\n")
-
+    with traced_operation("concat_files", {"file_count": len(input_files), "batch_size": batch_size}):
+        total_files = len(input_files)
+        total_batches = (total_files + batch_size - 1) // batch_size
+        intermediate_files = []
+        temp_dir = Path(tempfile.mkdtemp(prefix="frigate_concat_"))
+        
         try:
-            cmd = [
-                "ffmpeg",
-                "-y",  # Overwrite output
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(concat_file),
-                "-c", "copy",
-            ]
+            files_processed_count = 0
+            for i in range(total_batches):
+                batch_start_index = i * batch_size
+                batch_end_index = min((i + 1) * batch_size, total_files)
+                batch = input_files[batch_start_index:batch_end_index]
+                batch_output_path = temp_dir / f"intermediate_{i}.mp4"
+                
+                logger.info("Processing batch", batch_num=i+1, of=total_batches, file_count=len(batch))
+                
+                if not _concat_batch(batch, batch_output_path):
+                    logger.error(f"Failed to concatenate batch {i+1}")
+                    return False
+                
+                intermediate_files.append(batch_output_path)
+                
+                files_processed_count += len(batch)
+                if progress_callback:
+                    percent = min(100.0, (files_processed_count / total_files) * 100)
+                    progress_callback(ConcatProgress(
+                        files_total=total_files,
+                        files_processed=files_processed_count,
+                        bytes_written=0, # Not easily available for file-based progress
+                        elapsed_seconds=0, # Not easily available for file-based progress
+                        percent=percent,
+                    ))
 
-            # Add progress output if callback provided
-            if progress_callback:
-                cmd.extend(["-progress", "pipe:1"])
-
-            cmd.append(str(output_path))
-
-            logger.info("Starting concat", file_count=len(input_files), total_size=total_size)
-
-            start_time = time.time()
-
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-
-            if progress_callback and process.stdout:
-                last_bytes = 0
-                for line in process.stdout:
-                    line = line.strip()
-                    # Parse total_size for progress
-                    if line.startswith("total_size="):
-                        try:
-                            bytes_written = int(line.split("=")[1])
-                            elapsed = time.time() - start_time
-                            # Estimate percent based on bytes written vs expected
-                            percent = min(99.0, (bytes_written / total_size) * 100) if total_size > 0 else None
-                            progress_callback(ConcatProgress(
-                                files_total=len(input_files),
-                                files_processed=0,
-                                bytes_written=bytes_written,
-                                elapsed_seconds=elapsed,
-                                percent=percent,
-                            ))
-                            last_bytes = bytes_written
-                        except (ValueError, IndexError):
-                            pass
-
-                stderr = process.stderr.read() if process.stderr else ""
-                process.wait()
-            else:
-                _, stderr = process.communicate()
-
-            if process.returncode != 0:
-                logger.error("Concat failed", stderr=stderr)
-                return False
-
-            logger.info("Concat complete", output=str(output_path))
-            return True
+            # Finally, concatenate the intermediate files.
+            # This step also needs to report progress if there's more than one intermediate file.
+            final_concat_successful = _concat_batch(intermediate_files, output_path)
+            
+            if final_concat_successful and progress_callback:
+                progress_callback(ConcatProgress(
+                    files_total=total_files,
+                    files_processed=total_files,
+                    bytes_written=0,
+                    elapsed_seconds=0,
+                    percent=100.0,
+                ))
+            return final_concat_successful
 
         finally:
-            concat_file.unlink(missing_ok=True)
+            # Clean up the temporary directory.
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _concat_batch(
+    input_files: list[Path],
+    output_path: Path,
+    progress_callback: Callable[[ConcatProgress], None] | None = None,
+) -> bool:
+    """Helper function to concatenate a single batch of files."""
+    import time
+
+    logger = get_logger()
+    
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        concat_file_list_path = Path(f.name)
+        for file_path in input_files:
+            # Resolve to absolute path to ensure ffmpeg can find the files
+            abs_path = file_path.resolve()
+            escaped = str(abs_path).replace("'", "'\\''")
+            f.write(f"file '{escaped}'\n")
+
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_file_list_path),
+            "-c", "copy",
+        ]
+        
+        # Add progress output if callback provided (only if re-encoding, copy doesn't give good progress)
+        # For concat -c copy, ffmpeg doesn't output reliable progress updates via pipe:1
+        # if progress_callback:
+        #     cmd.extend(["-progress", "pipe:1"])
+            
+        cmd.append(str(output_path))
+        
+        # Calculate total input size for logging and potential future progress estimation
+        total_size = sum(f.stat().st_size for f in input_files if f.exists())
+        logger.info("Starting batch concat", file_count=len(input_files), total_size=total_size)
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # For -c copy, ffmpeg typically doesn't send progress to stdout via -progress pipe:1
+        # Just consume stdout/stderr after process finishes
+        stdout, stderr = process.communicate()
+
+
+        if process.returncode != 0:
+            logger.error("Batch concat failed", stderr=stderr)
+            return False
+            
+        logger.info("Batch concat complete", output=str(output_path))
+        return True
+
+    finally:
+        concat_file_list_path.unlink(missing_ok=True)
+
 
 
 def encode_timelapse(
@@ -401,13 +444,11 @@ def encode_timelapse(
                 "-global_quality", "23",  # Quality level (lower = better, 18-28 typical)
             ])
         elif hwaccel == HWAccel.VAAPI:
-            # VAAPI: Use hardware encoding
+            # VAAPI: Use hardware encoding with -vaapi_device
             cmd.extend([
-                "-hwaccel", "vaapi",
-                "-hwaccel_device", "/dev/dri/renderD128",
-                "-hwaccel_output_format", "vaapi",
+                "-vaapi_device", "/dev/dri/renderD128",
                 "-i", str(input_path),
-                "-vf", f"setpts=PTS/{speed},hwupload,scale_vaapi=format=nv12",
+                "-vf", f"setpts=PTS/{speed},format=nv12,hwupload",
                 "-r", str(output_fps),
                 "-c:v", "h264_vaapi",
                 "-qp", "23",  # Quality parameter
