@@ -83,6 +83,33 @@ class TestParseFFmpegProgress:
         assert progress is not None
         assert progress.percent == 100.0
 
+    def test_parse_progress_pipe_format(self):
+        """Parses -progress pipe:1 out_time format."""
+        line = "out_time=00:00:30.500000"
+        progress = parse_ffmpeg_progress(line, total_duration=60.0)
+
+        assert progress is not None
+        assert abs(progress.time_seconds - 30.5) < 0.01
+        assert progress.percent == pytest.approx(50.83, rel=0.01)
+
+    def test_parse_progress_pipe_format_with_hours(self):
+        """Parses out_time with hours."""
+        line = "out_time=01:30:00.000000"
+        progress = parse_ffmpeg_progress(line, total_duration=7200.0)  # 2 hours target
+
+        assert progress is not None
+        assert progress.time_seconds == 5400.0  # 1.5 hours
+        assert progress.percent == 75.0
+
+    def test_parse_progress_pipe_no_percent_without_duration(self):
+        """out_time format returns None percent when no duration provided."""
+        line = "out_time=00:00:30.000000"
+        progress = parse_ffmpeg_progress(line)
+
+        assert progress is not None
+        assert progress.time_seconds == 30.0
+        assert progress.percent is None
+
 
 class TestGetVideoDuration:
     """Tests for video duration detection."""

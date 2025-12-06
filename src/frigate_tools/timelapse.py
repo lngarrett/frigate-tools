@@ -33,36 +33,62 @@ class ProgressInfo:
 def parse_ffmpeg_progress(line: str, total_duration: float | None = None) -> ProgressInfo | None:
     """Parse FFmpeg progress line.
 
-    FFmpeg outputs progress like:
-    frame=  123 fps= 30 ... time=00:00:04.10 ... speed=1.23x
+    Supports two formats:
+    1. Classic progress format: frame=123 fps=30 ... time=00:00:04.10 ... speed=1.23x
+       All fields on one line - requires frame AND time to be present.
+    2. -progress pipe:1 format: out_time=00:00:04.100000 (key=value on separate lines)
+       Only needs out_time line for progress calculation.
     """
+    # Try to match classic format (all on one line) or -progress format (separate lines)
     frame_match = re.search(r"frame=\s*(\d+)", line)
     fps_match = re.search(r"fps=\s*([\d.]+)", line)
-    time_match = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
     speed_match = re.search(r"speed=\s*([\d.]+)x", line)
 
-    if not (frame_match and time_match):
-        return None
+    # Check for out_time (from -progress pipe:1) - this is on its own line
+    out_time_match = re.search(r"^out_time=(\d+):(\d+):([\d.]+)", line)
+    # Check for classic time= format (on same line as frame=)
+    classic_time_match = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
 
-    frame = int(frame_match.group(1))
-    fps = float(fps_match.group(1)) if fps_match else 0.0
+    # For -progress format: just need out_time line to report progress
+    if out_time_match:
+        hours, minutes, seconds = out_time_match.groups()
+        time_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
-    hours, minutes, seconds = time_match.groups()
-    time_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        percent = None
+        if total_duration and total_duration > 0:
+            percent = min(100.0, (time_seconds / total_duration) * 100)
 
-    speed = float(speed_match.group(1)) if speed_match else 0.0
+        return ProgressInfo(
+            frame=0,  # Frame count not available on this line
+            fps=0.0,
+            time_seconds=time_seconds,
+            speed=0.0,
+            percent=percent,
+        )
 
-    percent = None
-    if total_duration and total_duration > 0:
-        percent = min(100.0, (time_seconds / total_duration) * 100)
+    # For classic format: need both frame and time on same line
+    if frame_match and classic_time_match:
+        frame = int(frame_match.group(1))
+        fps = float(fps_match.group(1)) if fps_match else 0.0
 
-    return ProgressInfo(
-        frame=frame,
-        fps=fps,
-        time_seconds=time_seconds,
-        speed=speed,
-        percent=percent,
-    )
+        hours, minutes, seconds = classic_time_match.groups()
+        time_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+        speed = float(speed_match.group(1)) if speed_match else 0.0
+
+        percent = None
+        if total_duration and total_duration > 0:
+            percent = min(100.0, (time_seconds / total_duration) * 100)
+
+        return ProgressInfo(
+            frame=frame,
+            fps=fps,
+            time_seconds=time_seconds,
+            speed=speed,
+            percent=percent,
+        )
+
+    return None
 
 
 def get_video_info(file_path: Path) -> tuple[float, float]:
