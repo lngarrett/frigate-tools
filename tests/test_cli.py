@@ -178,9 +178,10 @@ class TestTimelapseCreateCommand:
 
     @patch("frigate_tools.cli.find_frigate_instance")
     @patch("frigate_tools.cli.generate_file_lists")
-    @patch("frigate_tools.cli.create_timelapse")
+    @patch("frigate_tools.timelapse.concat_files")
+    @patch("frigate_tools.cli.encode_timelapse")
     def test_creates_single_camera_timelapse(
-        self, mock_create, mock_file_lists, mock_find, tmp_path
+        self, mock_encode, mock_concat, mock_file_lists, mock_find, tmp_path
     ):
         """Creates timelapse for single camera."""
         # Setup mocks
@@ -188,7 +189,8 @@ class TestTimelapseCreateCommand:
         mock_file_lists.return_value = {
             "front": [tmp_path / "file1.mp4", tmp_path / "file2.mp4"]
         }
-        mock_create.return_value = True
+        mock_concat.return_value = True
+        mock_encode.return_value = True
 
         output = tmp_path / "output.mp4"
         # Create output file for size check
@@ -206,6 +208,9 @@ class TestTimelapseCreateCommand:
         # Check result
         assert result.exit_code == 0, result.stdout
         assert "Success" in result.stdout
+        # Verify two-step process was used
+        mock_concat.assert_called_once()
+        mock_encode.assert_called_once()
 
     @patch("frigate_tools.cli.find_frigate_instance")
     @patch("frigate_tools.cli.generate_file_lists")

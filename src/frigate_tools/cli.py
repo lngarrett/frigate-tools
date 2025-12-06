@@ -364,34 +364,46 @@ def timelapse_create(
 
     # Create timelapse based on camera count
     if len(camera_list) == 1:
-        # Single camera - use timelapse module directly
+        # Single camera - use timelapse module directly (two-step process)
+        from frigate_tools.timelapse import concat_files
         camera = camera_list[0]
         files = file_lists[camera]
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Encoding timelapse...", total=100)
+        # Step 1: Concatenate files (fast, no re-encoding)
+        temp_file = output.parent / f".{output.stem}_concat.mp4"
+        try:
+            with console.status("[bold blue]Step 1/2: Concatenating files..."):
+                if not concat_files(files, temp_file):
+                    console.print("[red]Error:[/red] File concatenation failed")
+                    raise typer.Exit(1)
 
-            def update_progress(info: ProgressInfo) -> None:
-                if info.percent is not None:
-                    progress.update(task, completed=info.percent)
+            # Step 2: Encode timelapse
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Step 2/2: Encoding timelapse...", total=100)
 
-            success = create_timelapse(
-                input_files=files,
-                output_path=output,
-                target_duration=target_duration,
-                preset=preset,
-                progress_callback=update_progress,
-            )
+                def update_progress(info: ProgressInfo) -> None:
+                    if info.percent is not None:
+                        progress.update(task, completed=info.percent)
 
-        if not success:
-            console.print("[red]Error:[/red] Timelapse creation failed")
-            raise typer.Exit(1)
+                success = encode_timelapse(
+                    input_path=temp_file,
+                    output_path=output,
+                    target_duration=target_duration,
+                    preset=preset,
+                    progress_callback=update_progress,
+                )
+
+            if not success:
+                console.print("[red]Error:[/red] Timelapse encoding failed")
+                raise typer.Exit(1)
+        finally:
+            temp_file.unlink(missing_ok=True)
 
     else:
         # Multi-camera - use grid layout with two-step approach
