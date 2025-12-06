@@ -5,12 +5,51 @@ filter_complex for xstack-based video tiling.
 """
 
 import math
+import re
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from frigate_tools.observability import get_logger, traced_operation
+
+
+@dataclass
+class GridProgress:
+    """Grid encoding progress information."""
+
+    percent: float | None = None
+    fps: float = 0.0
+    speed: float = 0.0
+    time_seconds: float = 0.0
+
+
+def parse_ffmpeg_progress(line: str, total_duration: float | None = None) -> GridProgress | None:
+    """Parse FFmpeg progress line for grid encoding."""
+    time_match = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
+    fps_match = re.search(r"fps=\s*([\d.]+)", line)
+    speed_match = re.search(r"speed=\s*([\d.]+)x", line)
+
+    if not time_match:
+        return None
+
+    hours, minutes, seconds = time_match.groups()
+    time_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+    fps = float(fps_match.group(1)) if fps_match else 0.0
+    speed = float(speed_match.group(1)) if speed_match else 0.0
+
+    percent = None
+    if total_duration and total_duration > 0:
+        percent = min(100.0, (time_seconds / total_duration) * 100)
+
+    return GridProgress(
+        percent=percent,
+        fps=fps,
+        speed=speed,
+        time_seconds=time_seconds,
+    )
 
 
 @dataclass
@@ -161,6 +200,8 @@ def create_grid_video(
     cell_width: int | None = None,
     cell_height: int | None = None,
     preset: str = "fast",
+    progress_callback: Callable[[GridProgress], None] | None = None,
+    estimated_duration: float | None = None,
 ) -> bool:
     """Create a grid video from multiple camera inputs.
 
@@ -170,6 +211,8 @@ def create_grid_video(
         cell_width: Width of each cell in grid (auto-detected if None)
         cell_height: Height of each cell in grid (auto-detected if None)
         preset: FFmpeg encoding preset
+        progress_callback: Optional callback for progress updates
+        estimated_duration: Estimated output duration (for progress %)
 
     Returns:
         True if successful, False otherwise
@@ -241,8 +284,13 @@ def create_grid_video(
                 "-map", "[out]",
                 "-preset", preset,
                 "-an",  # No audio for grid
-                str(output_path),
             ])
+
+            # Add progress output if callback provided
+            if progress_callback:
+                cmd.extend(["-progress", "pipe:1"])
+
+            cmd.append(str(output_path))
 
             logger.info("Starting grid encoding", cameras=camera_names)
 
@@ -253,7 +301,17 @@ def create_grid_video(
                 text=True,
             )
 
-            _, stderr = process.communicate()
+            if progress_callback and process.stdout:
+                # Parse progress from stdout
+                for line in process.stdout:
+                    progress = parse_ffmpeg_progress(line.strip(), estimated_duration)
+                    if progress:
+                        progress_callback(progress)
+                # Read any remaining stderr and wait
+                stderr = process.stderr.read() if process.stderr else ""
+                process.wait()
+            else:
+                _, stderr = process.communicate()
 
             if process.returncode != 0:
                 logger.error("Grid encoding failed", stderr=stderr)

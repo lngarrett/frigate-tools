@@ -4,6 +4,7 @@ Finds recording segments overlapping a time range and concatenates them
 into a single output file.
 """
 
+import re
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -22,6 +23,20 @@ class ClipProgress:
     stage: str  # "finding", "concatenating", "encoding"
     percent: float | None = None
     message: str | None = None
+
+
+def parse_ffmpeg_progress(line: str, total_duration: float | None = None) -> float | None:
+    """Parse FFmpeg progress line and return percent complete."""
+    time_match = re.search(r"time=(\d+):(\d+):([\d.]+)", line)
+    if not time_match:
+        return None
+
+    hours, minutes, seconds = time_match.groups()
+    time_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+    if total_duration and total_duration > 0:
+        return min(100.0, (time_seconds / total_duration) * 100)
+    return None
 
 
 def find_overlapping_segments(
@@ -60,6 +75,8 @@ def concat_clip(
     output_path: Path,
     reencode: bool = False,
     preset: str = "fast",
+    progress_callback: Callable[[float], None] | None = None,
+    estimated_duration: float | None = None,
 ) -> bool:
     """Concatenate video segments into a single clip.
 
@@ -69,6 +86,8 @@ def concat_clip(
         reencode: If True, re-encode video (slower, better compatibility).
                   If False (default), use -c copy (fast, no quality loss).
         preset: FFmpeg encoding preset (only used if reencode=True)
+        progress_callback: Optional callback receiving percent complete (0-100)
+        estimated_duration: Estimated duration for progress calculation
 
     Returns:
         True if successful, False otherwise
@@ -102,6 +121,9 @@ def concat_clip(
             if reencode:
                 # Re-encode for better compatibility
                 cmd.extend(["-preset", preset])
+                # Add progress output if callback provided
+                if progress_callback:
+                    cmd.extend(["-progress", "pipe:1"])
             else:
                 # Stream copy (fast, no re-encoding)
                 cmd.extend(["-c", "copy"])
@@ -121,7 +143,16 @@ def concat_clip(
                 text=True,
             )
 
-            _, stderr = process.communicate()
+            if reencode and progress_callback and process.stdout:
+                # Parse progress from stdout during re-encode
+                for line in process.stdout:
+                    percent = parse_ffmpeg_progress(line.strip(), estimated_duration)
+                    if percent is not None:
+                        progress_callback(percent)
+                stderr = process.stderr.read() if process.stderr else ""
+                process.wait()
+            else:
+                _, stderr = process.communicate()
 
             if process.returncode != 0:
                 logger.error("Clip concatenation failed", stderr=stderr)
@@ -195,12 +226,26 @@ def create_clip(
                 message=f"Concatenating {len(files)} segments...",
             ))
 
+        # Estimate duration for progress (each segment ~10 seconds)
+        estimated_duration = len(files) * 10
+
+        # Create progress wrapper that converts percent to ClipProgress
+        def encode_progress(percent: float) -> None:
+            if progress_callback:
+                progress_callback(ClipProgress(
+                    stage="encoding",
+                    percent=percent,
+                    message="Re-encoding...",
+                ))
+
         # Concatenate
         success = concat_clip(
             input_files=files,
             output_path=output_path,
             reencode=reencode,
             preset=preset,
+            progress_callback=encode_progress if reencode else None,
+            estimated_duration=estimated_duration if reencode else None,
         )
 
         if success and progress_callback:

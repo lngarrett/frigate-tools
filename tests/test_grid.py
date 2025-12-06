@@ -7,10 +7,12 @@ import pytest
 
 from frigate_tools.grid import (
     GridLayout,
+    GridProgress,
     SyncedFileSet,
     calculate_grid_layout,
     create_grid_video,
     generate_xstack_filter,
+    parse_ffmpeg_progress,
     sync_file_lists,
 )
 
@@ -242,3 +244,75 @@ class TestCreateGridVideo:
         # Temp concat files should be cleaned up
         # We can't easily verify this without inspecting internals,
         # but we verify the function completes successfully
+
+    @patch("subprocess.Popen")
+    def test_progress_callback_called(self, mock_popen, tmp_path):
+        """Progress callback is called during encoding."""
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read.return_value = ""
+
+        # Simulate progress output
+        mock_stdout = MagicMock()
+        mock_stdout.__iter__ = lambda self: iter([
+            "frame=  100 fps= 30 time=00:00:10.00 speed=1.2x",
+            "frame=  200 fps= 30 time=00:00:20.00 speed=1.2x",
+        ])
+        mock_process.stdout = mock_stdout
+        mock_popen.return_value = mock_process
+
+        files = {"cam1": [tmp_path / "a.mp4"]}
+        files["cam1"][0].touch()
+
+        progress_calls = []
+        def track_progress(info: GridProgress) -> None:
+            progress_calls.append(info)
+
+        create_grid_video(
+            files,
+            tmp_path / "output.mp4",
+            progress_callback=track_progress,
+            estimated_duration=100.0,
+        )
+
+        # Should have received progress updates
+        assert len(progress_calls) >= 1
+        # Progress should include percent when duration is known
+        for call in progress_calls:
+            assert call.percent is not None
+
+
+class TestParseFFmpegProgress:
+    """Tests for ffmpeg progress parsing."""
+
+    def test_parse_standard_progress_line(self):
+        """Parses standard ffmpeg progress output."""
+        line = "frame=  100 fps= 30 time=00:00:10.00 speed=1.2x"
+        result = parse_ffmpeg_progress(line)
+
+        assert result is not None
+        assert result.time_seconds == 10.0
+        assert result.fps == 30.0
+        assert result.speed == 1.2
+
+    def test_parse_with_total_duration(self):
+        """Calculates percent when total duration known."""
+        line = "frame=  100 fps= 30 time=00:00:30.00 speed=1.2x"
+        result = parse_ffmpeg_progress(line, total_duration=60.0)
+
+        assert result is not None
+        assert result.percent == 50.0
+
+    def test_parse_invalid_line(self):
+        """Returns None for non-progress lines."""
+        result = parse_ffmpeg_progress("Starting encoding...")
+        assert result is None
+
+    def test_percent_capped_at_100(self):
+        """Percent is capped at 100."""
+        line = "frame=  500 fps= 30 time=00:02:00.00 speed=1.2x"
+        result = parse_ffmpeg_progress(line, total_duration=60.0)
+
+        assert result is not None
+        assert result.percent == 100.0

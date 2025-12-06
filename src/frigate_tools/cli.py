@@ -12,7 +12,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 from frigate_tools.clip import create_clip, create_multi_camera_clip, ClipProgress
 from frigate_tools.file_list import generate_file_lists
-from frigate_tools.grid import calculate_grid_layout, create_grid_video
+from frigate_tools.grid import calculate_grid_layout, create_grid_video, GridProgress
 from frigate_tools.observability import init_observability, shutdown_observability, get_logger
 from frigate_tools.timelapse import create_timelapse, encode_timelapse, ProgressInfo
 
@@ -77,6 +77,59 @@ def find_frigate_instance() -> Path | None:
                 if subdir.is_dir() and (subdir / "recordings").exists():
                     return subdir
     return None
+
+
+def estimate_source_size(files: list[Path]) -> int:
+    """Estimate total size of source files in bytes."""
+    total = 0
+    for f in files:
+        if f.exists():
+            total += f.stat().st_size
+    return total
+
+
+def estimate_output_size(source_size: int, target_duration: float, source_duration_estimate: float) -> int:
+    """Estimate output file size based on source size and compression.
+
+    Args:
+        source_size: Total source file size in bytes
+        target_duration: Target output duration in seconds
+        source_duration_estimate: Estimated source duration in seconds
+
+    Returns:
+        Estimated output size in bytes
+    """
+    if source_duration_estimate <= 0:
+        return 0
+
+    # Ratio of output to source duration
+    duration_ratio = target_duration / source_duration_estimate
+
+    # Re-encoding typically produces 0.3-0.5x the size of -c copy concat
+    # With fast preset, estimate ~0.4x of proportional size
+    compression_factor = 0.4
+
+    return int(source_size * duration_ratio * compression_factor)
+
+
+def get_available_disk_space(path: Path) -> int:
+    """Get available disk space in bytes for the filesystem containing path."""
+    import shutil
+    # Get the parent directory if path doesn't exist yet
+    check_path = path if path.exists() else path.parent
+    while not check_path.exists() and check_path != check_path.parent:
+        check_path = check_path.parent
+    usage = shutil.disk_usage(check_path)
+    return usage.free
+
+
+def format_size(size_bytes: int) -> str:
+    """Format size in bytes to human-readable string."""
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(size_bytes) < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} PB"
 
 
 def parse_duration(duration_str: str) -> float:
@@ -177,6 +230,13 @@ def timelapse_create(
             help="FFmpeg encoding preset",
         ),
     ] = "fast",
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show what would be done without creating files",
+        ),
+    ] = False,
 ) -> None:
     """Create a timelapse from Frigate recordings.
 
@@ -245,18 +305,62 @@ def timelapse_create(
             skip_hours=skip_hours_list if skip_hours_list else None,
         )
 
-    # Report file counts
+    # Report file counts and calculate sizes
     total_files = 0
+    all_files = []
     for camera, files in file_lists.items():
         console.print(f"  {camera}: {len(files)} files")
         total_files += len(files)
+        all_files.extend(files)
 
     if total_files == 0:
         console.print("[red]Error:[/red] No recording files found")
         raise typer.Exit(1)
 
     console.print(f"  [bold]Total: {total_files} files[/bold]")
+
+    # Calculate sizes for dry-run or disk space check
+    source_size = estimate_source_size(all_files)
+    # Estimate ~10 seconds per file (Frigate default segment length)
+    source_duration_estimate = total_files * 10
+    estimated_output_size = estimate_output_size(source_size, target_duration, source_duration_estimate)
+    available_space = get_available_disk_space(output)
+
+    console.print(f"  Source size: {format_size(source_size)}")
+    console.print(f"  Estimated output: {format_size(estimated_output_size)}")
+    console.print(f"  Available space: {format_size(available_space)}")
     console.print()
+
+    # Dry-run mode - show what would happen and exit
+    if dry_run:
+        console.print("[bold yellow]Dry run - no files created[/bold yellow]")
+        console.print()
+        console.print("Would create:")
+        console.print(f"  Output file: {output}")
+        console.print(f"  Estimated size: {format_size(estimated_output_size)}")
+        console.print()
+
+        if estimated_output_size > available_space:
+            console.print(
+                f"[red]Warning:[/red] Estimated output ({format_size(estimated_output_size)}) "
+                f"exceeds available space ({format_size(available_space)})"
+            )
+        else:
+            console.print("[green]Disk space check: OK[/green]")
+
+        console.print()
+        console.print(f"Speed factor: {source_duration_estimate / target_duration:.1f}x")
+        return
+
+    # Check disk space before proceeding
+    if estimated_output_size > available_space * 0.9:  # Leave 10% buffer
+        console.print(
+            f"[red]Error:[/red] Insufficient disk space. "
+            f"Estimated output ({format_size(estimated_output_size)}) "
+            f"may exceed available space ({format_size(available_space)})"
+        )
+        console.print("Use --dry-run to see details without creating files.")
+        raise typer.Exit(1)
 
     # Create timelapse based on camera count
     if len(camera_list) == 1:
@@ -300,11 +404,28 @@ def timelapse_create(
         grid_temp = temp_dir / "grid_full_speed.mp4"
 
         try:
-            with console.status("[bold blue]Step 1/2: Creating grid layout..."):
+            # Estimate source duration for progress calculation
+            grid_duration_estimate = total_files * 10  # ~10 seconds per segment
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Step 1/2: Creating grid layout...", total=100)
+
+                def update_grid_progress(info: GridProgress) -> None:
+                    if info.percent is not None:
+                        progress.update(task, completed=info.percent)
+
                 success = create_grid_video(
                     camera_files=file_lists,
                     output_path=grid_temp,
                     preset=preset,
+                    progress_callback=update_grid_progress,
+                    estimated_duration=grid_duration_estimate,
                 )
 
             if not success:
@@ -499,16 +620,45 @@ def clip_create(
         # Single camera
         camera = camera_list[0]
 
-        with console.status(f"[bold blue]Creating clip for {camera}..."):
-            success = create_clip(
-                instance_path=instance,
-                camera=camera,
-                start=start,
-                end=end,
-                output_path=output,
-                reencode=reencode,
-                preset=preset,
-            )
+        if reencode:
+            # Use progress bar for re-encoding operations
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(f"Creating clip for {camera}...", total=100)
+
+                def update_clip_progress(info: ClipProgress) -> None:
+                    if info.percent is not None:
+                        progress.update(task, completed=info.percent)
+                    elif info.message:
+                        progress.update(task, description=info.message)
+
+                success = create_clip(
+                    instance_path=instance,
+                    camera=camera,
+                    start=start,
+                    end=end,
+                    output_path=output,
+                    reencode=reencode,
+                    preset=preset,
+                    progress_callback=update_clip_progress,
+                )
+        else:
+            # Use spinner for fast stream copy
+            with console.status(f"[bold blue]Creating clip for {camera}..."):
+                success = create_clip(
+                    instance_path=instance,
+                    camera=camera,
+                    start=start,
+                    end=end,
+                    output_path=output,
+                    reencode=reencode,
+                    preset=preset,
+                )
 
         if not success:
             console.print("[red]Error:[/red] Clip creation failed")

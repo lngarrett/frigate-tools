@@ -1,5 +1,6 @@
 """Tests for timelapse encoding module."""
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,19 @@ from frigate_tools.timelapse import (
     get_video_duration,
     parse_ffmpeg_progress,
 )
+
+
+def ffmpeg_available() -> bool:
+    """Check if ffmpeg is available on the system."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
 
 
 class TestParseFFmpegProgress:
@@ -309,3 +323,156 @@ class TestCreateTimelapse:
 
         # When keep_temp=True, we don't delete, but the mock creates the file
         # at a different path, so this test mainly verifies the flag is passed
+
+
+@pytest.mark.skipif(not ffmpeg_available(), reason="ffmpeg not available")
+class TestTimelapseIntegration:
+    """Integration tests using real video files.
+
+    These tests require ffmpeg to be installed and create actual video files.
+    They verify the full timelapse pipeline works end-to-end.
+    """
+
+    @pytest.fixture
+    def create_test_videos(self, tmp_path):
+        """Factory to create small test video files using ffmpeg.
+
+        Creates 1-second videos with a test pattern for fast encoding.
+        """
+        def _create(count: int = 3, duration: float = 1.0) -> list[Path]:
+            files = []
+            for i in range(count):
+                output = tmp_path / f"segment_{i:02d}.mp4"
+                # Use testsrc2 for fast generation with visible frame counter
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi",
+                    "-i", f"testsrc2=size=320x240:rate=30:duration={duration}",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p",
+                    str(output),
+                ]
+                result = subprocess.run(cmd, capture_output=True, timeout=30)
+                assert result.returncode == 0, f"Failed to create test video: {result.stderr}"
+                files.append(output)
+            return files
+
+        return _create
+
+    def test_get_video_duration_real_file(self, create_test_videos):
+        """get_video_duration returns correct duration for real file."""
+        files = create_test_videos(count=1, duration=2.0)
+
+        duration = get_video_duration(files[0])
+
+        # Should be approximately 2 seconds
+        assert 1.9 <= duration <= 2.1
+
+    def test_concat_files_real_videos(self, create_test_videos, tmp_path):
+        """concat_files concatenates real video files."""
+        files = create_test_videos(count=3, duration=1.0)
+        output = tmp_path / "concatenated.mp4"
+
+        result = concat_files(files, output)
+
+        assert result is True
+        assert output.exists()
+        # Duration should be ~3 seconds (3 x 1 second)
+        duration = get_video_duration(output)
+        assert 2.8 <= duration <= 3.2
+
+    def test_encode_timelapse_real_video(self, create_test_videos, tmp_path):
+        """encode_timelapse creates sped-up video from real file."""
+        # Create a 3-second video
+        files = create_test_videos(count=1, duration=3.0)
+        input_file = files[0]
+        output = tmp_path / "timelapse.mp4"
+
+        # Speed up to 1 second (3x speedup)
+        result = encode_timelapse(
+            input_path=input_file,
+            output_path=output,
+            target_duration=1.0,
+            preset="ultrafast",
+        )
+
+        assert result is True
+        assert output.exists()
+        # Output should be approximately 1 second
+        duration = get_video_duration(output)
+        assert 0.8 <= duration <= 1.2
+
+    def test_create_timelapse_full_pipeline(self, create_test_videos, tmp_path):
+        """create_timelapse works end-to-end with real files."""
+        # Create 5 x 1-second videos = 5 seconds total
+        files = create_test_videos(count=5, duration=1.0)
+        output = tmp_path / "final_timelapse.mp4"
+
+        # Target: 1 second output (5x speedup)
+        result = create_timelapse(
+            input_files=files,
+            output_path=output,
+            target_duration=1.0,
+            preset="ultrafast",
+        )
+
+        assert result is True
+        assert output.exists()
+
+        # Check output duration
+        duration = get_video_duration(output)
+        assert 0.8 <= duration <= 1.2
+
+        # Check file size is reasonable (should be small for 1 second)
+        file_size = output.stat().st_size
+        assert file_size > 1000  # At least 1KB
+        assert file_size < 500_000  # Less than 500KB
+
+    def test_create_timelapse_with_progress_callback(self, create_test_videos, tmp_path):
+        """Progress callback is called during encoding.
+
+        Note: For very short videos, encoding may complete too fast to emit
+        progress updates. We verify the callback mechanism works by checking
+        the timelapse was created successfully.
+        """
+        files = create_test_videos(count=3, duration=1.0)
+        output = tmp_path / "timelapse_progress.mp4"
+
+        progress_updates = []
+
+        def on_progress(info: ProgressInfo):
+            progress_updates.append(info)
+
+        result = create_timelapse(
+            input_files=files,
+            output_path=output,
+            target_duration=0.5,
+            preset="ultrafast",
+            progress_callback=on_progress,
+        )
+
+        assert result is True
+        assert output.exists()
+        # Note: Progress updates may be empty for very fast encodes
+        # The important thing is the callback didn't cause errors
+
+    def test_create_timelapse_large_speedup(self, create_test_videos, tmp_path):
+        """Handles large speedup factor (simulating long source videos)."""
+        # Create 10 x 1-second videos = 10 seconds total
+        files = create_test_videos(count=10, duration=1.0)
+        output = tmp_path / "fast_timelapse.mp4"
+
+        # Target: 0.5 second output (20x speedup)
+        result = create_timelapse(
+            input_files=files,
+            output_path=output,
+            target_duration=0.5,
+            preset="ultrafast",
+        )
+
+        assert result is True
+        assert output.exists()
+
+        duration = get_video_duration(output)
+        assert 0.3 <= duration <= 0.7

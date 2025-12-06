@@ -12,6 +12,7 @@ from frigate_tools.clip import (
     create_clip,
     create_multi_camera_clip,
     find_overlapping_segments,
+    parse_ffmpeg_progress,
 )
 
 
@@ -296,3 +297,100 @@ class TestCreateMultiCameraClip:
 
         assert result is not None
         mock_grid.assert_called_once()
+
+
+class TestConcatClipProgress:
+    """Tests for concat_clip progress callback."""
+
+    @patch("subprocess.Popen")
+    def test_progress_callback_during_reencode(self, mock_popen, tmp_path):
+        """Progress callback is called during re-encoding."""
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read.return_value = ""
+
+        # Simulate progress output
+        mock_stdout = MagicMock()
+        mock_stdout.__iter__ = lambda self: iter([
+            "frame=  100 fps= 30 time=00:00:10.00 speed=1.2x",
+            "frame=  200 fps= 30 time=00:00:20.00 speed=1.2x",
+        ])
+        mock_process.stdout = mock_stdout
+        mock_popen.return_value = mock_process
+
+        input_file = tmp_path / "a.mp4"
+        input_file.touch()
+
+        progress_values = []
+
+        def track_progress(percent: float) -> None:
+            progress_values.append(percent)
+
+        concat_clip(
+            [input_file],
+            tmp_path / "output.mp4",
+            reencode=True,
+            progress_callback=track_progress,
+            estimated_duration=100.0,
+        )
+
+        # Should have received progress updates
+        assert len(progress_values) >= 1
+
+    @patch("subprocess.Popen")
+    def test_no_progress_callback_for_stream_copy(self, mock_popen, tmp_path):
+        """No progress tracking for fast stream copy."""
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = ("", "")
+        mock_popen.return_value = mock_process
+
+        input_file = tmp_path / "a.mp4"
+        input_file.touch()
+
+        progress_values = []
+
+        def track_progress(percent: float) -> None:
+            progress_values.append(percent)
+
+        concat_clip(
+            [input_file],
+            tmp_path / "output.mp4",
+            reencode=False,  # Stream copy
+            progress_callback=track_progress,
+            estimated_duration=100.0,
+        )
+
+        # No progress because stream copy doesn't produce progress output
+        assert len(progress_values) == 0
+
+
+class TestParseFFmpegProgressClip:
+    """Tests for clip ffmpeg progress parsing."""
+
+    def test_parse_standard_progress_line(self):
+        """Parses standard ffmpeg progress output."""
+        line = "frame=  100 fps= 30 time=00:00:30.00 speed=1.2x"
+        result = parse_ffmpeg_progress(line, total_duration=60.0)
+
+        assert result == 50.0
+
+    def test_parse_without_duration(self):
+        """Returns None without duration."""
+        line = "frame=  100 fps= 30 time=00:00:30.00 speed=1.2x"
+        result = parse_ffmpeg_progress(line)
+
+        assert result is None
+
+    def test_parse_invalid_line(self):
+        """Returns None for non-progress lines."""
+        result = parse_ffmpeg_progress("Starting encoding...", 60.0)
+        assert result is None
+
+    def test_percent_capped_at_100(self):
+        """Percent is capped at 100."""
+        line = "frame=  500 fps= 30 time=00:02:00.00 speed=1.2x"
+        result = parse_ffmpeg_progress(line, total_duration=60.0)
+
+        assert result == 100.0

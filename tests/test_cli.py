@@ -6,7 +6,16 @@ from unittest.mock import patch, MagicMock
 import pytest
 from typer.testing import CliRunner
 
-from frigate_tools.cli import app, parse_duration, find_frigate_instance, DEFAULT_FRIGATE_PATHS
+from frigate_tools.cli import (
+    app,
+    parse_duration,
+    find_frigate_instance,
+    estimate_source_size,
+    estimate_output_size,
+    get_available_disk_space,
+    format_size,
+    DEFAULT_FRIGATE_PATHS,
+)
 
 runner = CliRunner()
 
@@ -282,3 +291,104 @@ class TestTimelapseCreateCommand:
 
         assert result.exit_code == 1
         assert "Invalid duration format" in result.stdout
+
+    @patch("frigate_tools.cli.find_frigate_instance")
+    @patch("frigate_tools.cli.generate_file_lists")
+    def test_dry_run_shows_estimates(self, mock_file_lists, mock_find, tmp_path):
+        """Dry run shows size estimates without creating files."""
+        mock_find.return_value = tmp_path
+
+        # Create test files with known sizes
+        test_file = tmp_path / "recordings" / "2025-12-05" / "12" / "front" / "00.00.mp4"
+        test_file.parent.mkdir(parents=True)
+        test_file.write_bytes(b"x" * 100000)  # 100KB
+
+        mock_file_lists.return_value = {
+            "front": [test_file]
+        }
+
+        output = tmp_path / "output.mp4"
+
+        result = runner.invoke(app, [
+            "timelapse", "create",
+            "--cameras", "front",
+            "--start", "2025-12-01T08:00",
+            "--end", "2025-12-01T12:00",
+            "--duration", "5m",
+            "--output", str(output),
+            "--dry-run",
+        ])
+
+        assert result.exit_code == 0, result.stdout
+        assert "Dry run" in result.stdout
+        assert "Would create" in result.stdout
+        assert "Estimated" in result.stdout
+        # Output file should NOT be created
+        assert not output.exists()
+
+
+class TestSizeEstimation:
+    """Tests for size estimation functions."""
+
+    def test_estimate_source_size(self, tmp_path):
+        """Estimates total size of source files."""
+        files = []
+        for i in range(3):
+            f = tmp_path / f"file{i}.mp4"
+            f.write_bytes(b"x" * (1000 * (i + 1)))  # 1KB, 2KB, 3KB
+            files.append(f)
+
+        size = estimate_source_size(files)
+        assert size == 6000  # 1000 + 2000 + 3000
+
+    def test_estimate_source_size_missing_files(self, tmp_path):
+        """Handles missing files gracefully."""
+        files = [tmp_path / "missing.mp4", tmp_path / "also_missing.mp4"]
+        size = estimate_source_size(files)
+        assert size == 0
+
+    def test_estimate_output_size(self):
+        """Estimates output size based on compression."""
+        source_size = 1_000_000  # 1MB
+        target_duration = 60  # 1 minute
+        source_duration = 600  # 10 minutes
+
+        # 10x speedup, 0.4 compression = 0.1 * 0.4 = 0.04x
+        estimated = estimate_output_size(source_size, target_duration, source_duration)
+        assert estimated == 40_000  # ~4% of source
+
+    def test_estimate_output_size_zero_duration(self):
+        """Handles zero source duration."""
+        estimated = estimate_output_size(1000, 60, 0)
+        assert estimated == 0
+
+    def test_get_available_disk_space(self, tmp_path):
+        """Gets available disk space for a path."""
+        space = get_available_disk_space(tmp_path)
+        assert space > 0  # Should have some space
+
+    def test_get_available_disk_space_nonexistent_path(self, tmp_path):
+        """Gets disk space for nonexistent path (uses parent)."""
+        nonexistent = tmp_path / "deep" / "nested" / "path"
+        space = get_available_disk_space(nonexistent)
+        assert space > 0
+
+
+class TestFormatSize:
+    """Tests for format_size function."""
+
+    def test_format_bytes(self):
+        """Formats bytes correctly."""
+        assert format_size(500) == "500.0 B"
+
+    def test_format_kilobytes(self):
+        """Formats kilobytes correctly."""
+        assert format_size(2048) == "2.0 KB"
+
+    def test_format_megabytes(self):
+        """Formats megabytes correctly."""
+        assert format_size(5 * 1024 * 1024) == "5.0 MB"
+
+    def test_format_gigabytes(self):
+        """Formats gigabytes correctly."""
+        assert format_size(3 * 1024 * 1024 * 1024) == "3.0 GB"
