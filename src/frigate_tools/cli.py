@@ -14,7 +14,7 @@ from frigate_tools.clip import create_clip, create_multi_camera_clip, ClipProgre
 from frigate_tools.file_list import generate_file_lists
 from frigate_tools.grid import calculate_grid_layout, create_grid_video, GridProgress
 from frigate_tools.observability import init_observability, shutdown_observability, get_logger
-from frigate_tools.timelapse import create_timelapse, encode_timelapse, ProgressInfo
+from frigate_tools.timelapse import create_timelapse, encode_timelapse, concat_files, ProgressInfo, ConcatProgress
 
 app = typer.Typer(
     name="frigate-tools",
@@ -365,15 +365,26 @@ def timelapse_create(
     # Create timelapse based on camera count
     if len(camera_list) == 1:
         # Single camera - use timelapse module directly (two-step process)
-        from frigate_tools.timelapse import concat_files
         camera = camera_list[0]
         files = file_lists[camera]
 
         # Step 1: Concatenate files (fast, no re-encoding)
         temp_file = output.parent / f".{output.stem}_concat.mp4"
         try:
-            with console.status("[bold blue]Step 1/2: Concatenating files..."):
-                if not concat_files(files, temp_file):
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(f"Step 1/2: Concatenating {len(files)} files...", total=100)
+
+                def update_concat_progress(info: ConcatProgress) -> None:
+                    if info.percent is not None:
+                        progress.update(task, completed=info.percent)
+
+                if not concat_files(files, temp_file, progress_callback=update_concat_progress):
                     console.print("[red]Error:[/red] File concatenation failed")
                     raise typer.Exit(1)
 

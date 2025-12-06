@@ -178,7 +178,7 @@ class TestTimelapseCreateCommand:
 
     @patch("frigate_tools.cli.find_frigate_instance")
     @patch("frigate_tools.cli.generate_file_lists")
-    @patch("frigate_tools.timelapse.concat_files")
+    @patch("frigate_tools.cli.concat_files")
     @patch("frigate_tools.cli.encode_timelapse")
     def test_creates_single_camera_timelapse(
         self, mock_encode, mock_concat, mock_file_lists, mock_find, tmp_path

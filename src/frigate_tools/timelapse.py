@@ -104,10 +104,63 @@ def get_video_duration(file_path: Path) -> float:
     return duration
 
 
+@dataclass
+class ConcatProgress:
+    """Concatenation progress information."""
+
+    files_total: int
+    files_processed: int
+    bytes_written: int
+    elapsed_seconds: float
+    percent: float | None = None
+
+
+def parse_concat_progress(line: str, total_files: int, start_time: float) -> ConcatProgress | None:
+    """Parse ffmpeg progress output during concatenation.
+
+    FFmpeg -progress outputs key=value pairs. We track out_time_ms for progress.
+    """
+    import time
+
+    # Look for out_time_ms which shows output duration in microseconds
+    if line.startswith("out_time_ms="):
+        try:
+            out_time_us = int(line.split("=")[1])
+            elapsed = time.time() - start_time
+            # We can't know exact file count from time, but we report what we have
+            return ConcatProgress(
+                files_total=total_files,
+                files_processed=0,  # Unknown during concat
+                bytes_written=0,
+                elapsed_seconds=elapsed,
+                percent=None,  # Can't calculate without knowing total duration
+            )
+        except (ValueError, IndexError):
+            pass
+
+    # Look for total_size which shows bytes written
+    if line.startswith("total_size="):
+        try:
+            import time
+            bytes_written = int(line.split("=")[1])
+            elapsed = time.time() - start_time
+            return ConcatProgress(
+                files_total=total_files,
+                files_processed=0,
+                bytes_written=bytes_written,
+                elapsed_seconds=elapsed,
+                percent=None,
+            )
+        except (ValueError, IndexError):
+            pass
+
+    return None
+
+
 def concat_files(
     input_files: list[Path],
     output_path: Path,
-    progress_callback: Callable[[ProgressInfo], None] | None = None,
+    progress_callback: Callable[[ConcatProgress], None] | None = None,
 ) -> bool:
     """Concatenate video files using ffmpeg concat demuxer.
 
@@ -116,11 +169,13 @@ def concat_files(
     Args:
         input_files: List of video files to concatenate
         output_path: Output file path
-        progress_callback: Optional callback for progress updates
+        progress_callback: Optional callback for progress updates (receives ConcatProgress)
 
     Returns:
         True if successful, False otherwise
     """
+    import time
+
     logger = get_logger()
 
     if not input_files:
@@ -128,6 +183,9 @@ def concat_files(
         return False
 
     with traced_operation("concat_files", {"file_count": len(input_files)}):
+        # Calculate total input size for progress estimation
+        total_size = sum(f.stat().st_size for f in input_files if f.exists())
+
         # Create concat file list
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             concat_file = Path(f.name)
@@ -144,10 +202,17 @@ def concat_files(
                 "-safe", "0",
                 "-i", str(concat_file),
                 "-c", "copy",
-                str(output_path),
             ]
 
-            logger.info("Starting concat", file_count=len(input_files))
+            # Add progress output if callback provided
+            if progress_callback:
+                cmd.extend(["-progress", "pipe:1"])
+
+            cmd.append(str(output_path))
+
+            logger.info("Starting concat", file_count=len(input_files), total_size=total_size)
+
+            start_time = time.time()
 
             process = subprocess.Popen(
                 cmd,
@@ -156,7 +221,32 @@ def concat_files(
                 text=True,
             )
 
-            _, stderr = process.communicate()
+            if progress_callback and process.stdout:
+                last_bytes = 0
+                for line in process.stdout:
+                    line = line.strip()
+                    # Parse total_size for progress
+                    if line.startswith("total_size="):
+                        try:
+                            bytes_written = int(line.split("=")[1])
+                            elapsed = time.time() - start_time
+                            # Estimate percent based on bytes written vs expected
+                            percent = min(99.0, (bytes_written / total_size) * 100) if total_size > 0 else None
+                            progress_callback(ConcatProgress(
+                                files_total=len(input_files),
+                                files_processed=0,
+                                bytes_written=bytes_written,
+                                elapsed_seconds=elapsed,
+                                percent=percent,
+                            ))
+                            last_bytes = bytes_written
+                        except (ValueError, IndexError):
+                            pass
+
+                stderr = process.stderr.read() if process.stderr else ""
+                process.wait()
+            else:
+                _, stderr = process.communicate()
 
             if process.returncode != 0:
                 logger.error("Concat failed", stderr=stderr)

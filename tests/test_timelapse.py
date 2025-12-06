@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from frigate_tools.timelapse import (
+    ConcatProgress,
     ProgressInfo,
     concat_files,
     create_timelapse,
@@ -167,6 +168,106 @@ class TestConcatFiles:
 
         result = concat_files(input_files, tmp_path / "output.mp4")
         assert result is False
+
+    @patch("subprocess.Popen")
+    def test_concat_with_progress_callback(self, mock_popen, tmp_path):
+        """Calls progress callback with ConcatProgress updates."""
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        # Simulate -progress pipe:1 output with total_size updates
+        mock_process.stdout = iter([
+            "total_size=50000\n",
+            "total_size=75000\n",
+            "total_size=100000\n",
+        ])
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read.return_value = ""
+        mock_popen.return_value = mock_process
+
+        # Create input files with known sizes (100KB total)
+        input_files = [tmp_path / "a.mp4", tmp_path / "b.mp4"]
+        input_files[0].write_bytes(b"x" * 50000)  # 50KB
+        input_files[1].write_bytes(b"x" * 50000)  # 50KB
+
+        progress_updates = []
+
+        def on_progress(info: ConcatProgress):
+            progress_updates.append(info)
+
+        result = concat_files(input_files, tmp_path / "output.mp4", progress_callback=on_progress)
+
+        assert result is True
+        assert len(progress_updates) == 3
+
+        # Check progress values are reasonable
+        assert progress_updates[0].bytes_written == 50000
+        assert progress_updates[1].bytes_written == 75000
+        assert progress_updates[2].bytes_written == 100000
+
+        # Verify percent calculation (based on bytes written / total size)
+        assert progress_updates[0].percent == pytest.approx(50.0)
+        assert progress_updates[1].percent == pytest.approx(75.0)
+        # Final progress capped at 99%
+        assert progress_updates[2].percent == pytest.approx(99.0)
+
+    @patch("subprocess.Popen")
+    def test_concat_progress_includes_file_count(self, mock_popen, tmp_path):
+        """ConcatProgress includes total file count."""
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.stdout = iter(["total_size=1000\n"])
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read.return_value = ""
+        mock_popen.return_value = mock_process
+
+        input_files = [tmp_path / f"{i}.mp4" for i in range(5)]
+        for f in input_files:
+            f.write_bytes(b"x" * 200)  # 200 bytes each = 1000 total
+
+        captured_progress = []
+
+        def on_progress(info: ConcatProgress):
+            captured_progress.append(info)
+
+        concat_files(input_files, tmp_path / "output.mp4", progress_callback=on_progress)
+
+        assert len(captured_progress) > 0
+        assert captured_progress[0].files_total == 5
+
+    @patch("subprocess.Popen")
+    def test_concat_adds_progress_flag_when_callback(self, mock_popen, tmp_path):
+        """Adds -progress pipe:1 when progress callback is provided."""
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.stdout = iter([])
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read.return_value = ""
+        mock_popen.return_value = mock_process
+
+        input_files = [tmp_path / "a.mp4"]
+        input_files[0].touch()
+
+        concat_files(input_files, tmp_path / "output.mp4", progress_callback=lambda x: None)
+
+        call_args = mock_popen.call_args[0][0]
+        assert "-progress" in call_args
+        assert "pipe:1" in call_args
+
+    @patch("subprocess.Popen")
+    def test_concat_no_progress_flag_without_callback(self, mock_popen, tmp_path):
+        """Does not add -progress flag when no callback provided."""
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.communicate.return_value = ("", "")
+        mock_popen.return_value = mock_process
+
+        input_files = [tmp_path / "a.mp4"]
+        input_files[0].touch()
+
+        concat_files(input_files, tmp_path / "output.mp4")
+
+        call_args = mock_popen.call_args[0][0]
+        assert "-progress" not in call_args
 
 
 class TestEncodeTimelapse:
@@ -380,6 +481,28 @@ class TestTimelapseIntegration:
         # Duration should be ~3 seconds (3 x 1 second)
         duration = get_video_duration(output)
         assert 2.8 <= duration <= 3.2
+
+    def test_concat_files_with_progress_callback(self, create_test_videos, tmp_path):
+        """concat_files calls progress callback with byte-based progress."""
+        files = create_test_videos(count=3, duration=1.0)
+        output = tmp_path / "concatenated_progress.mp4"
+
+        progress_updates = []
+
+        def on_progress(info: ConcatProgress):
+            progress_updates.append(info)
+
+        result = concat_files(files, output, progress_callback=on_progress)
+
+        assert result is True
+        assert output.exists()
+        # Should have received at least one progress update
+        assert len(progress_updates) > 0
+        # All updates should include file count
+        assert all(p.files_total == 3 for p in progress_updates)
+        # Progress should show bytes written increasing
+        if len(progress_updates) > 1:
+            assert progress_updates[-1].bytes_written >= progress_updates[0].bytes_written
 
     def test_encode_timelapse_real_video(self, create_test_videos, tmp_path):
         """encode_timelapse creates sped-up video from real file."""
