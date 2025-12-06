@@ -5,8 +5,7 @@ Two-step approach:
 2. Encode with setpts filter to create timelapse
 
 Uses setpts filter with frame dropping for efficient timelapse creation.
-The setpts approach is faster than select filter because ffmpeg only
-decodes and encodes frames that will be in the output.
+Supports hardware acceleration (Intel QSV, VAAPI) when available.
 """
 
 import re
@@ -14,9 +13,93 @@ import subprocess
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from frigate_tools.observability import get_logger, traced_operation
+
+
+class HWAccel(Enum):
+    """Hardware acceleration types."""
+    NONE = "none"
+    QSV = "qsv"       # Intel Quick Sync Video
+    VAAPI = "vaapi"   # Video Acceleration API (Linux)
+
+
+def detect_hwaccel() -> HWAccel:
+    """Detect available hardware acceleration.
+
+    Checks for Intel QSV first (faster), then VAAPI.
+    Returns HWAccel.NONE if no hardware acceleration is available.
+    """
+    logger = get_logger()
+
+    # Check for render device (needed for both QSV and VAAPI)
+    render_device = Path("/dev/dri/renderD128")
+    if not render_device.exists():
+        logger.debug("No render device found, using software encoding")
+        return HWAccel.NONE
+
+    # Check for QSV support by testing if h264_qsv encoder is available
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if "h264_qsv" in result.stdout:
+            # Verify QSV actually works with a quick test
+            test_result = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-v", "error",
+                    "-init_hw_device", "qsv=qsv:hw",
+                    "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+                    "-c:v", "h264_qsv", "-f", "null", "-"
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if test_result.returncode == 0:
+                logger.info("Using Intel QSV hardware acceleration")
+                return HWAccel.QSV
+
+        # Check for VAAPI support
+        if "h264_vaapi" in result.stdout:
+            test_result = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-v", "error",
+                    "-init_hw_device", "vaapi=vaapi:/dev/dri/renderD128",
+                    "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+                    "-vf", "format=nv12,hwupload",
+                    "-c:v", "h264_vaapi", "-f", "null", "-"
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if test_result.returncode == 0:
+                logger.info("Using VAAPI hardware acceleration")
+                return HWAccel.VAAPI
+
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    logger.debug("No hardware acceleration available, using software encoding")
+    return HWAccel.NONE
+
+
+# Cache hardware detection result
+_hwaccel_cache: HWAccel | None = None
+
+
+def get_hwaccel() -> HWAccel:
+    """Get cached hardware acceleration type."""
+    global _hwaccel_cache
+    if _hwaccel_cache is None:
+        _hwaccel_cache = detect_hwaccel()
+    return _hwaccel_cache
 
 
 @dataclass
@@ -141,48 +224,6 @@ class ConcatProgress:
     percent: float | None = None
 
 
-def parse_concat_progress(line: str, total_files: int, start_time: float) -> ConcatProgress | None:
-    """Parse ffmpeg progress output during concatenation.
-
-    FFmpeg -progress outputs key=value pairs. We track out_time_ms for progress.
-    """
-    import time
-
-    # Look for out_time_ms which shows output duration in microseconds
-    if line.startswith("out_time_ms="):
-        try:
-            out_time_us = int(line.split("=")[1])
-            elapsed = time.time() - start_time
-            # We can't know exact file count from time, but we report what we have
-            return ConcatProgress(
-                files_total=total_files,
-                files_processed=0,  # Unknown during concat
-                bytes_written=0,
-                elapsed_seconds=elapsed,
-                percent=None,  # Can't calculate without knowing total duration
-            )
-        except (ValueError, IndexError):
-            pass
-
-    # Look for total_size which shows bytes written
-    if line.startswith("total_size="):
-        try:
-            import time
-            bytes_written = int(line.split("=")[1])
-            elapsed = time.time() - start_time
-            return ConcatProgress(
-                files_total=total_files,
-                files_processed=0,
-                bytes_written=bytes_written,
-                elapsed_seconds=elapsed,
-                percent=None,
-            )
-        except (ValueError, IndexError):
-            pass
-
-    return None
-
-
 def concat_files(
     input_files: list[Path],
     output_path: Path,
@@ -292,12 +333,12 @@ def encode_timelapse(
     output_fps: float = 30.0,
     preset: str = "fast",
     progress_callback: Callable[[ProgressInfo], None] | None = None,
+    hwaccel: HWAccel | None = None,
 ) -> bool:
     """Encode video with timelapse effect using setpts filter.
 
     Uses setpts filter to speed up video by adjusting presentation timestamps.
-    FFmpeg automatically drops frames to match output framerate, which is
-    much faster than the select filter approach (which decodes all frames).
+    Supports hardware acceleration (Intel QSV, VAAPI) for faster encoding.
 
     Args:
         input_path: Input video file
@@ -306,15 +347,20 @@ def encode_timelapse(
         output_fps: Output frame rate (default 30)
         preset: FFmpeg preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow)
         progress_callback: Optional callback(ProgressInfo) for progress updates
+        hwaccel: Hardware acceleration to use (auto-detected if None)
 
     Returns:
         True if successful, False otherwise
     """
     logger = get_logger()
 
+    # Auto-detect hardware acceleration if not specified
+    if hwaccel is None:
+        hwaccel = get_hwaccel()
+
     with traced_operation(
         "encode_timelapse",
-        {"target_duration": target_duration, "preset": preset},
+        {"target_duration": target_duration, "preset": preset, "hwaccel": hwaccel.value},
     ):
         # Get source duration
         source_duration, source_fps = get_video_info(input_path)
@@ -335,23 +381,52 @@ def encode_timelapse(
             target_duration=target_duration,
             output_fps=output_fps,
             speed=speed,
+            hwaccel=hwaccel.value,
         )
 
-        # Use setpts to speed up video - PTS/N makes video N times faster
-        # FFmpeg will drop frames to match output framerate, which is efficient
-        filter_complex = f"setpts=PTS/{speed}"
+        # Build command based on hardware acceleration type
+        cmd = ["ffmpeg", "-y"]
 
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", str(input_path),
-            "-vf", filter_complex,
-            "-r", str(output_fps),
+        if hwaccel == HWAccel.QSV:
+            # Intel QSV: Use hardware decoding and encoding
+            cmd.extend([
+                "-hwaccel", "qsv",
+                "-hwaccel_output_format", "qsv",
+                "-i", str(input_path),
+                # QSV filter chain: scale for setpts equivalent, then encode
+                "-vf", f"setpts=PTS/{speed}",
+                "-r", str(output_fps),
+                "-c:v", "h264_qsv",
+                "-preset", _qsv_preset(preset),
+                "-global_quality", "23",  # Quality level (lower = better, 18-28 typical)
+            ])
+        elif hwaccel == HWAccel.VAAPI:
+            # VAAPI: Use hardware encoding
+            cmd.extend([
+                "-hwaccel", "vaapi",
+                "-hwaccel_device", "/dev/dri/renderD128",
+                "-hwaccel_output_format", "vaapi",
+                "-i", str(input_path),
+                "-vf", f"setpts=PTS/{speed},hwupload,scale_vaapi=format=nv12",
+                "-r", str(output_fps),
+                "-c:v", "h264_vaapi",
+                "-qp", "23",  # Quality parameter
+            ])
+        else:
+            # Software encoding (default)
+            cmd.extend([
+                "-i", str(input_path),
+                "-vf", f"setpts=PTS/{speed}",
+                "-r", str(output_fps),
+                "-preset", preset,
+            ])
+
+        # Common options
+        cmd.extend([
             "-an",  # Remove audio (doesn't make sense for timelapse)
-            "-preset", preset,
             "-progress", "pipe:1",
             str(output_path),
-        ]
+        ])
 
         process = subprocess.Popen(
             cmd,
@@ -377,11 +452,43 @@ def encode_timelapse(
         process.wait()
 
         if process.returncode != 0:
-            logger.error("Encoding failed", stderr=stderr_output)
+            logger.error("Encoding failed", stderr=stderr_output, hwaccel=hwaccel.value)
+            # Fall back to software encoding if hardware failed
+            if hwaccel != HWAccel.NONE:
+                logger.info("Falling back to software encoding")
+                return encode_timelapse(
+                    input_path,
+                    output_path,
+                    target_duration,
+                    output_fps,
+                    preset,
+                    progress_callback,
+                    hwaccel=HWAccel.NONE,
+                )
             return False
 
-        logger.info("Encoding complete", output=str(output_path))
+        logger.info("Encoding complete", output=str(output_path), hwaccel=hwaccel.value)
         return True
+
+
+def _qsv_preset(preset: str) -> str:
+    """Map software preset to QSV preset.
+
+    QSV presets: veryfast, faster, fast, medium, slow, slower, veryslow
+    """
+    # QSV has fewer presets, map appropriately
+    mapping = {
+        "ultrafast": "veryfast",
+        "superfast": "veryfast",
+        "veryfast": "veryfast",
+        "faster": "faster",
+        "fast": "fast",
+        "medium": "medium",
+        "slow": "slow",
+        "slower": "slower",
+        "veryslow": "veryslow",
+    }
+    return mapping.get(preset, "fast")
 
 
 def create_timelapse(
@@ -391,6 +498,7 @@ def create_timelapse(
     preset: str = "fast",
     progress_callback: Callable[[ProgressInfo], None] | None = None,
     keep_temp: bool = False,
+    hwaccel: HWAccel | None = None,
 ) -> bool:
     """Create a timelapse video from input files.
 
@@ -405,6 +513,7 @@ def create_timelapse(
         preset: FFmpeg encoding preset
         progress_callback: Optional callback for progress updates
         keep_temp: Keep temporary concatenated file (for debugging)
+        hwaccel: Hardware acceleration to use (auto-detected if None)
 
     Returns:
         True if successful, False otherwise
@@ -431,6 +540,7 @@ def create_timelapse(
                 target_duration,
                 preset=preset,
                 progress_callback=progress_callback,
+                hwaccel=hwaccel,
             ):
                 return False
 

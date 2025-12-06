@@ -8,6 +8,7 @@ import pytest
 
 from frigate_tools.timelapse import (
     ConcatProgress,
+    HWAccel,
     ProgressInfo,
     concat_files,
     create_timelapse,
@@ -297,13 +298,87 @@ class TestConcatFiles:
         assert "-progress" not in call_args
 
 
+class TestHardwareAcceleration:
+    """Tests for hardware acceleration detection."""
+
+    @patch("subprocess.run")
+    @patch("pathlib.Path.exists")
+    def test_detect_no_render_device(self, mock_exists, mock_run):
+        """Returns NONE when render device doesn't exist."""
+        from frigate_tools.timelapse import detect_hwaccel, HWAccel, _hwaccel_cache
+        import frigate_tools.timelapse as timelapse_module
+
+        # Clear cache before test
+        timelapse_module._hwaccel_cache = None
+
+        mock_exists.return_value = False
+        result = detect_hwaccel()
+        assert result == HWAccel.NONE
+        mock_run.assert_not_called()
+
+    @patch("subprocess.run")
+    @patch("pathlib.Path.exists")
+    def test_detect_qsv_available(self, mock_exists, mock_run):
+        """Detects QSV when encoder and test both succeed."""
+        from frigate_tools.timelapse import detect_hwaccel, HWAccel
+        import frigate_tools.timelapse as timelapse_module
+
+        timelapse_module._hwaccel_cache = None
+        mock_exists.return_value = True
+
+        # First call checks encoders, second call tests QSV
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="h264_qsv"),
+            MagicMock(returncode=0),
+        ]
+
+        result = detect_hwaccel()
+        assert result == HWAccel.QSV
+
+    @patch("subprocess.run")
+    @patch("pathlib.Path.exists")
+    def test_detect_vaapi_fallback(self, mock_exists, mock_run):
+        """Falls back to VAAPI when QSV test fails."""
+        from frigate_tools.timelapse import detect_hwaccel, HWAccel
+        import frigate_tools.timelapse as timelapse_module
+
+        timelapse_module._hwaccel_cache = None
+        mock_exists.return_value = True
+
+        # First call checks encoders, second call tests QSV (fails), third tests VAAPI
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="h264_qsv h264_vaapi"),
+            MagicMock(returncode=1),  # QSV test fails
+            MagicMock(returncode=0),  # VAAPI test succeeds
+        ]
+
+        result = detect_hwaccel()
+        assert result == HWAccel.VAAPI
+
+    @patch("subprocess.run")
+    @patch("pathlib.Path.exists")
+    def test_detect_software_fallback(self, mock_exists, mock_run):
+        """Falls back to software when no hardware acceleration works."""
+        from frigate_tools.timelapse import detect_hwaccel, HWAccel
+        import frigate_tools.timelapse as timelapse_module
+
+        timelapse_module._hwaccel_cache = None
+        mock_exists.return_value = True
+
+        # No hardware encoders listed
+        mock_run.return_value = MagicMock(returncode=0, stdout="libx264 libx265")
+
+        result = detect_hwaccel()
+        assert result == HWAccel.NONE
+
+
 class TestEncodeTimelapse:
     """Tests for timelapse encoding."""
 
     @patch("frigate_tools.timelapse.get_video_info")
     @patch("subprocess.Popen")
-    def test_encode_uses_frame_selection(self, mock_popen, mock_info, tmp_path):
-        """Uses select filter for frame sampling."""
+    def test_encode_uses_setpts_filter(self, mock_popen, mock_info, tmp_path):
+        """Uses setpts filter for timelapse speedup."""
         mock_info.return_value = (600.0, 30.0)  # 10 minutes at 30fps
         mock_process = MagicMock()
         mock_process.returncode = 0
@@ -317,7 +392,10 @@ class TestEncodeTimelapse:
         output_path = tmp_path / "output.mp4"
 
         # Target 1 minute output from 10 minute source = 10x speed
-        result = encode_timelapse(input_path, output_path, target_duration=60.0)
+        # Use hwaccel=HWAccel.NONE to skip hardware detection
+        result = encode_timelapse(
+            input_path, output_path, target_duration=60.0, hwaccel=HWAccel.NONE
+        )
 
         assert result is True
 
@@ -336,7 +414,9 @@ class TestEncodeTimelapse:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
-        result = encode_timelapse(input_path, tmp_path / "output.mp4", target_duration=60.0)
+        result = encode_timelapse(
+            input_path, tmp_path / "output.mp4", target_duration=60.0, hwaccel=HWAccel.NONE
+        )
         assert result is False
 
     @patch("frigate_tools.timelapse.get_video_info")
@@ -363,6 +443,7 @@ class TestEncodeTimelapse:
             tmp_path / "output.mp4",
             target_duration=10.0,
             progress_callback=callback,
+            hwaccel=HWAccel.NONE,
         )
 
         assert callback.call_count == 2
