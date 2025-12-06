@@ -353,3 +353,120 @@ class TestGenerateFileLists:
         )
 
         assert len(result["front"]) == 0
+
+
+class TestGenerateFileListsCombinedFilters:
+    """Integration tests for generate_file_lists with combined skip_days and skip_hours."""
+
+    @pytest.fixture
+    def mock_week_dir(self, tmp_path):
+        """Create mock Frigate dir with a week of recordings across multiple hours.
+
+        Structure covers:
+        - Mon Dec 1 to Sun Dec 7, 2025
+        - Multiple hours per day to test hour filtering
+        """
+        camera_path = tmp_path / "recordings" / "front"
+
+        # Create files for each day of the week
+        for day in range(1, 8):  # Dec 1-7
+            date_str = f"2025-12-0{day}"
+            date_path = camera_path / date_str
+
+            # Create files at: 6am, 10am, 12pm, 6pm, 10pm
+            hours = ["06", "10", "12", "18", "22"]
+            for hour in hours:
+                hour_path = date_path / hour
+                hour_path.mkdir(parents=True)
+                (hour_path / "00.00.mp4").touch()
+                (hour_path / "30.00.mp4").touch()
+
+        return tmp_path
+
+    def test_combined_skip_days_and_hours(self, mock_week_dir):
+        """Test that both skip_days and skip_hours are applied together.
+
+        With skip_days=["sat", "sun"] and skip_hours=["16-8"]:
+        - Excludes all Saturday (Dec 6) and Sunday (Dec 7) files
+        - Excludes 6am, 6pm, 10pm files (outside 8am-4pm)
+        - Keeps only Mon-Fri 10am and 12pm files
+        """
+        result = generate_file_lists(
+            cameras=["front"],
+            start=datetime(2025, 12, 1, 0, 0, 0),
+            end=datetime(2025, 12, 8, 0, 0, 0),
+            instance_path=mock_week_dir,
+            skip_days=["sat", "sun"],  # Skip weekend
+            skip_hours=["16-8"],  # Skip 4pm to 8am (keep 8am-4pm)
+        )
+
+        files = result["front"]
+
+        # Mon-Fri = 5 days
+        # Per day: 10am (2 files) + 12pm (2 files) = 4 files kept
+        # 6am, 6pm, 10pm = 6 files skipped per day
+        # Total: 5 days * 4 files = 20 files
+        assert len(files) == 20
+
+        # Verify no weekend files
+        for f in files:
+            path_str = str(f)
+            assert "2025-12-06" not in path_str  # Saturday
+            assert "2025-12-07" not in path_str  # Sunday
+
+        # Verify only 8am-4pm files (10 and 12 hour directories)
+        for f in files:
+            # Extract hour from path: .../YYYY-MM-DD/HH/...
+            hour = int(f.parent.name)
+            assert 8 <= hour < 16, f"File at hour {hour} should be filtered: {f}"
+
+    def test_combined_filters_keep_weekday_business_hours(self, mock_week_dir):
+        """Keep only weekday business hours (9am-5pm)."""
+        result = generate_file_lists(
+            cameras=["front"],
+            start=datetime(2025, 12, 1, 0, 0, 0),
+            end=datetime(2025, 12, 8, 0, 0, 0),
+            instance_path=mock_week_dir,
+            skip_days=["sat", "sun"],  # Skip weekend
+            skip_hours=["17-9"],  # Skip 5pm to 9am (keep 9am-5pm)
+        )
+
+        files = result["front"]
+
+        # Mon-Fri = 5 days
+        # Per day: 10am (2) + 12pm (2) = 4 files (6am and 6pm+ are outside 9-5)
+        # Total: 5 * 4 = 20 files
+        assert len(files) == 20
+
+    def test_combined_filters_strict(self, mock_week_dir):
+        """Very strict filters that exclude most files."""
+        result = generate_file_lists(
+            cameras=["front"],
+            start=datetime(2025, 12, 1, 0, 0, 0),
+            end=datetime(2025, 12, 8, 0, 0, 0),
+            instance_path=mock_week_dir,
+            skip_days=["mon", "tue", "wed", "thu", "fri"],  # Skip all weekdays
+            skip_hours=["18-10"],  # Skip 6pm to 10am
+        )
+
+        files = result["front"]
+
+        # Only Sat/Sun, only 10am-6pm
+        # Sat+Sun = 2 days
+        # Per day: 10am (2) + 12pm (2) = 4 files
+        # Total: 2 * 4 = 8 files
+        assert len(files) == 8
+
+    def test_combined_filters_all_excluded(self, mock_week_dir):
+        """Filters that exclude everything."""
+        result = generate_file_lists(
+            cameras=["front"],
+            start=datetime(2025, 12, 1, 0, 0, 0),
+            end=datetime(2025, 12, 8, 0, 0, 0),
+            instance_path=mock_week_dir,
+            skip_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"],  # All days
+            skip_hours=["16-8"],
+        )
+
+        files = result["front"]
+        assert len(files) == 0

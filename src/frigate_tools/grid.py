@@ -6,6 +6,7 @@ filter_complex for xstack-based video tiling.
 
 import math
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -204,7 +205,6 @@ def create_grid_video(
 
         # For each camera, create a concat file
         concat_files = []
-        import tempfile
 
         for camera in camera_names:
             files = camera_files[camera]

@@ -209,16 +209,23 @@ def encode_timelapse(
         )
 
         # Parse progress from stdout
-        if progress_callback and process.stdout:
+        # We read stdout completely before waiting for the process.
+        # This is safe because we consume the entire stream, then wait().
+        stderr_output = ""
+        if process.stdout:
             for line in process.stdout:
-                progress = parse_ffmpeg_progress(line.strip(), target_duration)
-                if progress:
-                    progress_callback(progress)
+                if progress_callback:
+                    progress = parse_ffmpeg_progress(line.strip(), target_duration)
+                    if progress:
+                        progress_callback(progress)
 
-        _, stderr = process.communicate()
+        # Read any remaining stderr and wait for process
+        if process.stderr:
+            stderr_output = process.stderr.read()
+        process.wait()
 
         if process.returncode != 0:
-            logger.error("Encoding failed", stderr=stderr)
+            logger.error("Encoding failed", stderr=stderr_output)
             return False
 
         logger.info("Encoding complete", output=str(output_path))
