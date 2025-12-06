@@ -2,10 +2,11 @@
 
 Two-step approach:
 1. Concat input files with -c copy to temp file (fast, no re-encoding)
-2. Encode with frame selection filter to create timelapse
+2. Encode with setpts filter to create timelapse
 
-Uses select filter to sample every Nth frame, avoiding the need to
-decode all frames like setpts would require.
+Uses setpts filter with frame dropping for efficient timelapse creation.
+The setpts approach is faster than select filter because ffmpeg only
+decodes and encodes frames that will be in the output.
 """
 
 import re
@@ -176,10 +177,11 @@ def encode_timelapse(
     preset: str = "fast",
     progress_callback: Callable[[ProgressInfo], None] | None = None,
 ) -> bool:
-    """Encode video with timelapse effect using frame selection.
+    """Encode video with timelapse effect using setpts filter.
 
-    Uses select filter to sample every Nth frame, which is much faster than
-    setpts because ffmpeg can skip decoding frames that won't be used.
+    Uses setpts filter to speed up video by adjusting presentation timestamps.
+    FFmpeg automatically drops frames to match output framerate, which is
+    much faster than the select filter approach (which decodes all frames).
 
     Args:
         input_path: Input video file
@@ -198,7 +200,7 @@ def encode_timelapse(
         "encode_timelapse",
         {"target_duration": target_duration, "preset": preset},
     ):
-        # Get source duration and fps
+        # Get source duration
         source_duration, source_fps = get_video_info(input_path)
         if source_duration <= 0:
             logger.error("Could not determine source duration")
@@ -207,14 +209,7 @@ def encode_timelapse(
         if source_fps <= 0:
             source_fps = 30.0  # Assume 30fps if detection fails
 
-        # Calculate frame selection interval
-        # Total source frames = source_duration * source_fps
-        # Total output frames = target_duration * output_fps
-        # Select every Nth frame where N = source_frames / output_frames
-        total_source_frames = source_duration * source_fps
-        total_output_frames = target_duration * output_fps
-        frame_interval = max(1, int(total_source_frames / total_output_frames))
-
+        # Calculate speed factor
         speed = source_duration / target_duration
 
         logger.info(
@@ -224,12 +219,11 @@ def encode_timelapse(
             target_duration=target_duration,
             output_fps=output_fps,
             speed=speed,
-            frame_interval=frame_interval,
         )
 
-        # Use select filter to pick every Nth frame, then setpts to fix timestamps
-        # The select filter is much faster because ffmpeg skips decoding unneeded frames
-        filter_complex = f"select='not(mod(n\\,{frame_interval}))',setpts=N/({output_fps}*TB)"
+        # Use setpts to speed up video - PTS/N makes video N times faster
+        # FFmpeg will drop frames to match output framerate, which is efficient
+        filter_complex = f"setpts=PTS/{speed}"
 
         cmd = [
             "ffmpeg",

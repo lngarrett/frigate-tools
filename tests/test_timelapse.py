@@ -189,17 +189,16 @@ class TestEncodeTimelapse:
         output_path = tmp_path / "output.mp4"
 
         # Target 1 minute output from 10 minute source = 10x speed
-        # 600s * 30fps = 18000 frames, 60s * 30fps = 1800 frames
-        # frame_interval = 18000 / 1800 = 10
         result = encode_timelapse(input_path, output_path, target_duration=60.0)
 
         assert result is True
 
-        # Check select filter was applied
+        # Check setpts filter was applied with correct speed factor
         call_args = mock_popen.call_args[0][0]
         filter_idx = call_args.index("-vf") + 1
-        assert "select=" in call_args[filter_idx]
-        assert "mod(n" in call_args[filter_idx]
+        assert "setpts=PTS/" in call_args[filter_idx]
+        # Speed should be 600/60 = 10
+        assert "10" in call_args[filter_idx]
 
     @patch("frigate_tools.timelapse.get_video_info")
     def test_encode_fails_without_duration(self, mock_info, tmp_path):
