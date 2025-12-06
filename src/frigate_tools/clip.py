@@ -14,6 +14,7 @@ from pathlib import Path
 
 from frigate_tools.file_list import find_recording_files
 from frigate_tools.observability import get_logger, traced_operation
+from frigate_tools.timelapse import HWAccel, get_hwaccel
 
 
 @dataclass
@@ -119,8 +120,30 @@ def concat_clip(
             ]
 
             if reencode:
-                # Re-encode for better compatibility
-                cmd.extend(["-preset", preset])
+                # Auto-detect hardware acceleration
+                hwaccel = get_hwaccel()
+                logger.info("Using hardware acceleration for clip re-encoding", hwaccel=hwaccel.value)
+
+                # Build command based on hardware acceleration type
+                if hwaccel == HWAccel.QSV:
+                    cmd.extend([
+                        "-hwaccel", "qsv",
+                        "-hwaccel_output_format", "qsv",
+                        "-c:v", "h264_qsv",
+                        "-preset", "medium", # QSV presets are different, "medium" is a good balance
+                        "-global_quality", "23",
+                    ])
+                elif hwaccel == HWAccel.VAAPI:
+                    cmd.extend([
+                        "-vaapi_device", "/dev/dri/renderD128",
+                        "-vf", "format=nv12,hwupload",
+                        "-c:v", "h264_vaapi",
+                        "-qp", "23",
+                    ])
+                else:
+                    # Software encoding
+                    cmd.extend(["-c:v", "libx264", "-preset", preset])
+
                 # Add progress output if callback provided
                 if progress_callback:
                     cmd.extend(["-progress", "pipe:1"])
