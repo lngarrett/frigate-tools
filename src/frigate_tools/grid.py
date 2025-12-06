@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from frigate_tools.observability import get_logger, traced_operation
+from frigate_tools.timelapse import HWAccel, get_hwaccel
 
 
 @dataclass
@@ -202,6 +203,7 @@ def create_grid_video(
     preset: str = "fast",
     progress_callback: Callable[[GridProgress], None] | None = None,
     estimated_duration: float | None = None,
+    hwaccel: HWAccel | None = None,
 ) -> bool:
     """Create a grid video from multiple camera inputs.
 
@@ -213,6 +215,7 @@ def create_grid_video(
         preset: FFmpeg encoding preset
         progress_callback: Optional callback for progress updates
         estimated_duration: Estimated output duration (for progress %)
+        hwaccel: Hardware acceleration to use (auto-detected if None)
 
     Returns:
         True if successful, False otherwise
@@ -228,8 +231,12 @@ def create_grid_video(
 
     with traced_operation(
         "create_grid_video",
-        {"camera_count": camera_count, "output": str(output_path)},
+        {"camera_count": camera_count, "output": str(output_path), "hwaccel": hwaccel.value if hwaccel else "None"},
     ):
+        # Auto-detect hardware acceleration if not specified
+        if hwaccel is None:
+            hwaccel = get_hwaccel()
+
         layout = calculate_grid_layout(camera_count)
         logger.info(
             "Grid layout calculated",
@@ -282,9 +289,25 @@ def create_grid_video(
             # Output options
             cmd.extend([
                 "-map", "[out]",
-                "-preset", preset,
                 "-an",  # No audio for grid
             ])
+
+            # Hardware acceleration for output encoding
+            if hwaccel == HWAccel.QSV:
+                cmd.extend([
+                    "-c:v", "h264_qsv",
+                    "-preset", "medium", # QSV presets are different
+                    "-global_quality", "23",
+                ])
+            elif hwaccel == HWAccel.VAAPI:
+                cmd.extend([
+                    "-vf", "format=nv12,hwupload", # Needed for VAAPI output
+                    "-c:v", "h264_vaapi",
+                    "-qp", "23",
+                ])
+            else:
+                # Software encoding
+                cmd.extend(["-c:v", "libx264", "-preset", preset])
 
             # Add progress output if callback provided
             if progress_callback:

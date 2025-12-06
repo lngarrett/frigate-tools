@@ -14,7 +14,15 @@ from frigate_tools.clip import create_clip, create_multi_camera_clip, ClipProgre
 from frigate_tools.file_list import generate_file_lists
 from frigate_tools.grid import calculate_grid_layout, create_grid_video, GridProgress
 from frigate_tools.observability import init_observability, shutdown_observability, get_logger
-from frigate_tools.timelapse import create_timelapse, encode_timelapse, concat_files, ProgressInfo, ConcatProgress
+from frigate_tools.timelapse import (
+    create_timelapse,
+    encode_timelapse,
+    concat_files,
+    ProgressInfo,
+    ConcatProgress,
+    HWAccel,
+    get_hwaccel,
+)
 
 app = typer.Typer(
     name="frigate-tools",
@@ -294,6 +302,14 @@ def timelapse_create(
         console.print(f"  Skipping hours: {', '.join(skip_hours_list)}")
     console.print()
 
+    # Determine hardware acceleration once
+    hwaccel = get_hwaccel()
+    if hwaccel == HWAccel.NONE:
+        console.print("[dim]Using software encoding.[/dim]")
+    else:
+        console.print(f"[dim]Using hardware acceleration: {hwaccel.value}[/dim]")
+    console.print()
+
     # Generate file lists
     with console.status("[bold blue]Finding recording files..."):
         file_lists = generate_file_lists(
@@ -408,6 +424,7 @@ def timelapse_create(
                     target_duration=target_duration,
                     preset=preset,
                     progress_callback=update_progress,
+                    hwaccel=hwaccel,
                 )
 
             if not success:
@@ -449,6 +466,7 @@ def timelapse_create(
                     preset=preset,
                     progress_callback=update_grid_progress,
                     estimated_duration=grid_duration_estimate,
+                    hwaccel=hwaccel,
                 )
 
             if not success:
@@ -475,6 +493,7 @@ def timelapse_create(
                     target_duration=target_duration,
                     preset=preset,
                     progress_callback=update_progress,
+                    hwaccel=hwaccel,
                 )
 
             if not success:
