@@ -77,7 +77,7 @@ class TestGetVideoDuration:
         """Returns duration from ffprobe output."""
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="123.456\n",
+            stdout='{"format": {"duration": "123.456"}, "streams": [{"r_frame_rate": "30/1"}]}',
         )
 
         duration = get_video_duration(Path("/test/video.mp4"))
@@ -99,7 +99,7 @@ class TestGetVideoDuration:
         """Returns 0 on invalid ffprobe output."""
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="not a number\n",
+            stdout="not valid json\n",
         )
 
         duration = get_video_duration(Path("/test/video.mp4"))
@@ -158,15 +158,16 @@ class TestConcatFiles:
 class TestEncodeTimelapse:
     """Tests for timelapse encoding."""
 
-    @patch("frigate_tools.timelapse.get_video_duration")
+    @patch("frigate_tools.timelapse.get_video_info")
     @patch("subprocess.Popen")
-    def test_encode_calculates_pts_multiplier(self, mock_popen, mock_duration, tmp_path):
-        """Calculates correct PTS multiplier for speed adjustment."""
-        mock_duration.return_value = 600.0  # 10 minutes
+    def test_encode_uses_frame_selection(self, mock_popen, mock_info, tmp_path):
+        """Uses select filter for frame sampling."""
+        mock_info.return_value = (600.0, 30.0)  # 10 minutes at 30fps
         mock_process = MagicMock()
         mock_process.returncode = 0
         mock_process.stdout = iter([])
-        mock_process.communicate.return_value = ("", "")
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read.return_value = ""
         mock_popen.return_value = mock_process
 
         input_path = tmp_path / "input.mp4"
@@ -174,21 +175,22 @@ class TestEncodeTimelapse:
         output_path = tmp_path / "output.mp4"
 
         # Target 1 minute output from 10 minute source = 10x speed
-        # PTS multiplier = 1/10 = 0.1
+        # 600s * 30fps = 18000 frames, 60s * 30fps = 1800 frames
+        # frame_interval = 18000 / 1800 = 10
         result = encode_timelapse(input_path, output_path, target_duration=60.0)
 
         assert result is True
 
-        # Check setpts filter was applied
+        # Check select filter was applied
         call_args = mock_popen.call_args[0][0]
-        filter_idx = call_args.index("-filter:v") + 1
-        assert "setpts=" in call_args[filter_idx]
-        assert "0.1" in call_args[filter_idx]
+        filter_idx = call_args.index("-vf") + 1
+        assert "select=" in call_args[filter_idx]
+        assert "mod(n" in call_args[filter_idx]
 
-    @patch("frigate_tools.timelapse.get_video_duration")
-    def test_encode_fails_without_duration(self, mock_duration, tmp_path):
+    @patch("frigate_tools.timelapse.get_video_info")
+    def test_encode_fails_without_duration(self, mock_info, tmp_path):
         """Returns False when source duration cannot be determined."""
-        mock_duration.return_value = 0.0
+        mock_info.return_value = (0.0, 0.0)
 
         input_path = tmp_path / "input.mp4"
         input_path.touch()
@@ -196,18 +198,19 @@ class TestEncodeTimelapse:
         result = encode_timelapse(input_path, tmp_path / "output.mp4", target_duration=60.0)
         assert result is False
 
-    @patch("frigate_tools.timelapse.get_video_duration")
+    @patch("frigate_tools.timelapse.get_video_info")
     @patch("subprocess.Popen")
-    def test_encode_with_progress_callback(self, mock_popen, mock_duration, tmp_path):
+    def test_encode_with_progress_callback(self, mock_popen, mock_info, tmp_path):
         """Calls progress callback with updates."""
-        mock_duration.return_value = 100.0
+        mock_info.return_value = (100.0, 30.0)
         mock_process = MagicMock()
         mock_process.returncode = 0
         mock_process.stdout = iter([
             "frame=  50 fps= 30 time=00:00:05.00 speed=1.00x\n",
             "frame= 100 fps= 30 time=00:00:10.00 speed=1.00x\n",
         ])
-        mock_process.communicate.return_value = ("", "")
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read.return_value = ""
         mock_popen.return_value = mock_process
 
         callback = MagicMock()
