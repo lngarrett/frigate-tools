@@ -153,6 +153,8 @@ def find_recording_files(
 ) -> list[Path]:
     """Find recording files for a camera within a time range.
 
+    Frigate stores recordings as: recordings/YYYY-MM-DD/HH/camera/MM.SS.mp4
+
     Args:
         instance_path: Path to Frigate instance (contains recordings/ subdirectory)
         camera: Camera name
@@ -167,7 +169,7 @@ def find_recording_files(
     skip_days = skip_days or set()
     skip_hours = skip_hours or []
 
-    recordings_path = instance_path / "recordings" / camera
+    recordings_path = instance_path / "recordings"
     if not recordings_path.exists():
         return []
 
@@ -192,8 +194,13 @@ def find_recording_files(
                 except ValueError:
                     continue
 
-                # Find .mp4 files in this hour
-                for file_path in sorted(hour_path.glob("*.mp4")):
+                # Camera is inside the hour directory
+                camera_path = hour_path / camera
+                if not camera_path.exists():
+                    continue
+
+                # Find .mp4 files in this camera directory
+                for file_path in sorted(camera_path.glob("*.mp4")):
                     ts = parse_file_timestamp(date_dir, hour_path.name, file_path.name)
                     if ts is None:
                         continue

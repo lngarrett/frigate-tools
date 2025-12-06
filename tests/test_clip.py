@@ -20,18 +20,21 @@ class TestFindOverlappingSegments:
 
     @pytest.fixture
     def mock_frigate_dir(self, tmp_path):
-        """Create a mock Frigate directory structure."""
-        camera_path = tmp_path / "recordings" / "front"
+        """Create a mock Frigate directory structure.
+
+        Frigate structure: recordings/YYYY-MM-DD/HH/camera/MM.SS.mp4
+        """
+        recordings_path = tmp_path / "recordings"
 
         # Create segments for Dec 5, 2025
-        hour12 = camera_path / "2025-12-05" / "12"
+        hour12 = recordings_path / "2025-12-05" / "12" / "front"
         hour12.mkdir(parents=True)
         (hour12 / "00.00.mp4").touch()
         (hour12 / "15.00.mp4").touch()
         (hour12 / "30.00.mp4").touch()
         (hour12 / "45.00.mp4").touch()
 
-        hour13 = camera_path / "2025-12-05" / "13"
+        hour13 = recordings_path / "2025-12-05" / "13" / "front"
         hour13.mkdir(parents=True)
         (hour13 / "00.00.mp4").touch()
         (hour13 / "15.00.mp4").touch()
@@ -145,12 +148,15 @@ class TestCreateClip:
 
     @pytest.fixture
     def mock_frigate_dir(self, tmp_path):
-        """Create mock Frigate directory."""
-        camera_path = tmp_path / "recordings" / "front"
-        hour = camera_path / "2025-12-05" / "12"
-        hour.mkdir(parents=True)
-        (hour / "00.00.mp4").touch()
-        (hour / "30.00.mp4").touch()
+        """Create mock Frigate directory.
+
+        Frigate structure: recordings/YYYY-MM-DD/HH/camera/MM.SS.mp4
+        """
+        recordings_path = tmp_path / "recordings"
+        camera_path = recordings_path / "2025-12-05" / "12" / "front"
+        camera_path.mkdir(parents=True)
+        (camera_path / "00.00.mp4").touch()
+        (camera_path / "30.00.mp4").touch()
         return tmp_path
 
     @patch("frigate_tools.clip.concat_clip")
@@ -215,12 +221,15 @@ class TestCreateMultiCameraClip:
 
     @pytest.fixture
     def mock_multi_camera_dir(self, tmp_path):
-        """Create mock Frigate directory with multiple cameras."""
+        """Create mock Frigate directory with multiple cameras.
+
+        Frigate structure: recordings/YYYY-MM-DD/HH/camera/MM.SS.mp4
+        """
+        recordings_path = tmp_path / "recordings"
         for camera in ["front", "back"]:
-            camera_path = tmp_path / "recordings" / camera
-            hour = camera_path / "2025-12-05" / "12"
-            hour.mkdir(parents=True)
-            (hour / "00.00.mp4").touch()
+            camera_path = recordings_path / "2025-12-05" / "12" / camera
+            camera_path.mkdir(parents=True)
+            (camera_path / "00.00.mp4").touch()
         return tmp_path
 
     @patch("frigate_tools.clip.create_clip")

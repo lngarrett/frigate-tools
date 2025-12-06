@@ -208,28 +208,30 @@ class TestFindRecordingFiles:
 
     @pytest.fixture
     def mock_frigate_dir(self, tmp_path):
-        """Create a mock Frigate directory structure."""
-        # Create structure: instance/recordings/camera/YYYY-MM-DD/HH/MM.SS.mp4
-        camera_path = tmp_path / "recordings" / "front"
+        """Create a mock Frigate directory structure.
+
+        Frigate structure: recordings/YYYY-MM-DD/HH/camera/MM.SS.mp4
+        """
+        recordings_path = tmp_path / "recordings"
 
         # Dec 5, 2025 (Friday) - multiple hours
-        dec5 = camera_path / "2025-12-05"
-        (dec5 / "08").mkdir(parents=True)
-        (dec5 / "08" / "00.00.mp4").touch()
-        (dec5 / "08" / "30.00.mp4").touch()
+        dec5 = recordings_path / "2025-12-05"
+        (dec5 / "08" / "front").mkdir(parents=True)
+        (dec5 / "08" / "front" / "00.00.mp4").touch()
+        (dec5 / "08" / "front" / "30.00.mp4").touch()
 
-        (dec5 / "12").mkdir(parents=True)
-        (dec5 / "12" / "00.00.mp4").touch()
-        (dec5 / "12" / "30.00.mp4").touch()
+        (dec5 / "12" / "front").mkdir(parents=True)
+        (dec5 / "12" / "front" / "00.00.mp4").touch()
+        (dec5 / "12" / "front" / "30.00.mp4").touch()
 
-        (dec5 / "20").mkdir(parents=True)
-        (dec5 / "20" / "00.00.mp4").touch()
+        (dec5 / "20" / "front").mkdir(parents=True)
+        (dec5 / "20" / "front" / "00.00.mp4").touch()
 
         # Dec 6, 2025 (Saturday)
-        dec6 = camera_path / "2025-12-06"
-        (dec6 / "10").mkdir(parents=True)
-        (dec6 / "10" / "00.00.mp4").touch()
-        (dec6 / "10" / "30.00.mp4").touch()
+        dec6 = recordings_path / "2025-12-06"
+        (dec6 / "10" / "front").mkdir(parents=True)
+        (dec6 / "10" / "front" / "00.00.mp4").touch()
+        (dec6 / "10" / "front" / "30.00.mp4").touch()
 
         return tmp_path
 
@@ -308,9 +310,12 @@ class TestGenerateFileLists:
 
     @pytest.fixture
     def mock_multi_camera_dir(self, tmp_path):
-        """Create mock Frigate dir with multiple cameras."""
+        """Create mock Frigate dir with multiple cameras.
+
+        Frigate structure: recordings/YYYY-MM-DD/HH/camera/MM.SS.mp4
+        """
         for camera in ["front", "back"]:
-            camera_path = tmp_path / "recordings" / camera / "2025-12-05" / "12"
+            camera_path = tmp_path / "recordings" / "2025-12-05" / "12" / camera
             camera_path.mkdir(parents=True)
             (camera_path / "00.00.mp4").touch()
             (camera_path / "30.00.mp4").touch()
@@ -365,21 +370,23 @@ class TestGenerateFileListsCombinedFilters:
         Structure covers:
         - Mon Dec 1 to Sun Dec 7, 2025
         - Multiple hours per day to test hour filtering
+
+        Frigate structure: recordings/YYYY-MM-DD/HH/camera/MM.SS.mp4
         """
-        camera_path = tmp_path / "recordings" / "front"
+        recordings_path = tmp_path / "recordings"
 
         # Create files for each day of the week
         for day in range(1, 8):  # Dec 1-7
             date_str = f"2025-12-0{day}"
-            date_path = camera_path / date_str
+            date_path = recordings_path / date_str
 
             # Create files at: 6am, 10am, 12pm, 6pm, 10pm
             hours = ["06", "10", "12", "18", "22"]
             for hour in hours:
-                hour_path = date_path / hour
-                hour_path.mkdir(parents=True)
-                (hour_path / "00.00.mp4").touch()
-                (hour_path / "30.00.mp4").touch()
+                camera_path = date_path / hour / "front"
+                camera_path.mkdir(parents=True)
+                (camera_path / "00.00.mp4").touch()
+                (camera_path / "30.00.mp4").touch()
 
         return tmp_path
 
@@ -415,9 +422,10 @@ class TestGenerateFileListsCombinedFilters:
             assert "2025-12-07" not in path_str  # Sunday
 
         # Verify only 8am-4pm files (10 and 12 hour directories)
+        # Path structure: recordings/YYYY-MM-DD/HH/camera/MM.SS.mp4
         for f in files:
-            # Extract hour from path: .../YYYY-MM-DD/HH/...
-            hour = int(f.parent.name)
+            # Extract hour from path: parent is camera, parent.parent is hour
+            hour = int(f.parent.parent.name)
             assert 8 <= hour < 16, f"File at hour {hour} should be filtered: {f}"
 
     def test_combined_filters_keep_weekday_business_hours(self, mock_week_dir):
