@@ -7,8 +7,9 @@ This module finds and filters recording files by time range and calendar rules.
 """
 
 import re
+import time as time_module
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from frigate_tools.observability import get_logger, traced_operation
@@ -125,19 +126,58 @@ def parse_file_timestamp(
         return None
 
 
+def utc_to_local(dt: datetime) -> datetime:
+    """Convert naive UTC datetime to naive local datetime.
+
+    Used for skip_hours filtering: file timestamps are UTC but user-specified
+    skip hours are in local time.
+
+    Args:
+        dt: Naive datetime in UTC
+
+    Returns:
+        Naive datetime in local time
+    """
+    # Make the datetime UTC-aware
+    utc_aware = dt.replace(tzinfo=timezone.utc)
+
+    # Get local timezone offset for this specific time (accounting for DST)
+    local_timestamp = utc_aware.timestamp()
+    local_time = time_module.localtime(local_timestamp)
+
+    if local_time.tm_isdst > 0:
+        utc_offset = -time_module.altzone
+    else:
+        utc_offset = -time_module.timezone
+
+    local_tz = timezone(timedelta(seconds=utc_offset))
+    local_aware = utc_aware.astimezone(local_tz)
+    return local_aware.replace(tzinfo=None)
+
+
 def should_skip_timestamp(
     ts: datetime,
     skip_days: set[int],
     skip_hours: list[HourRange],
 ) -> bool:
-    """Check if a timestamp should be skipped based on calendar rules."""
-    # Check day of week
-    if ts.weekday() in skip_days:
+    """Check if a timestamp should be skipped based on calendar rules.
+
+    Args:
+        ts: UTC timestamp from file path
+        skip_days: Days of week to skip (0=Monday, 6=Sunday) - in local time
+        skip_hours: Hour ranges to skip - in local time
+    """
+    # Convert UTC timestamp to local time for calendar filtering
+    # User specifies skip rules in local time (e.g., "skip 4pm-8am" means local time)
+    local_ts = utc_to_local(ts)
+
+    # Check day of week (in local time)
+    if local_ts.weekday() in skip_days:
         return True
 
-    # Check hour ranges
+    # Check hour ranges (in local time)
     for hour_range in skip_hours:
-        if hour_range.contains(ts.hour):
+        if hour_range.contains(local_ts.hour):
             return True
 
     return False

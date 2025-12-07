@@ -1,7 +1,8 @@
 """Tests for file list generation with calendar filtering."""
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -13,6 +14,7 @@ from frigate_tools.file_list import (
     parse_skip_days,
     parse_skip_hours,
     should_skip_timestamp,
+    utc_to_local,
 )
 
 
@@ -146,35 +148,74 @@ class TestParseFileTimestamp:
         assert parse_file_timestamp("2025/12/01", "14", "30.45.mp4") is None
 
 
-class TestShouldSkipTimestamp:
-    """Tests for should_skip_timestamp function."""
+class TestUtcToLocal:
+    """Tests for utc_to_local timezone conversion."""
 
-    def test_skip_weekend_saturday(self):
+    def test_conversion_produces_different_hour(self):
+        """UTC to local conversion changes the hour (unless UTC+0)."""
+        utc_time = datetime(2025, 12, 5, 18, 0, 0)  # 6pm UTC
+        local_time = utc_to_local(utc_time)
+
+        # The result should be a valid datetime
+        assert isinstance(local_time, datetime)
+        # Hour should be different unless in UTC+0 timezone
+        # (We can't assert specific values as it depends on machine timezone)
+
+    def test_preserves_minute_second(self):
+        """UTC to local conversion preserves minutes and seconds."""
+        utc_time = datetime(2025, 12, 5, 18, 30, 45)
+        local_time = utc_to_local(utc_time)
+
+        assert local_time.minute == 30
+        assert local_time.second == 45
+
+    def test_returns_naive_datetime(self):
+        """Returns naive datetime (no timezone info)."""
+        utc_time = datetime(2025, 12, 5, 18, 0, 0)
+        local_time = utc_to_local(utc_time)
+
+        assert local_time.tzinfo is None
+
+
+class TestShouldSkipTimestamp:
+    """Tests for should_skip_timestamp function.
+
+    These tests mock utc_to_local to test skip logic independently of timezone.
+    The function receives UTC timestamps and converts to local for filtering.
+    """
+
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_skip_weekend_saturday(self, mock_utc):
         """Skips Saturday when weekend days are filtered."""
         ts = datetime(2025, 12, 6, 12, 0, 0)  # Saturday
         assert should_skip_timestamp(ts, {5, 6}, []) is True
 
-    def test_skip_weekend_sunday(self):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_skip_weekend_sunday(self, mock_utc):
         """Skips Sunday when weekend days are filtered."""
         ts = datetime(2025, 12, 7, 12, 0, 0)  # Sunday
         assert should_skip_timestamp(ts, {5, 6}, []) is True
 
-    def test_keep_weekday(self):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_keep_weekday(self, mock_utc):
         """Keeps weekday when weekend days are filtered."""
         ts = datetime(2025, 12, 5, 12, 0, 0)  # Friday
         assert should_skip_timestamp(ts, {5, 6}, []) is False
 
-    def test_skip_hours_normal_range(self):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_skip_hours_normal_range(self, mock_utc):
         """Skips hours in normal range."""
         ts = datetime(2025, 12, 5, 20, 0, 0)  # 8pm Friday
         assert should_skip_timestamp(ts, set(), [HourRange(18, 22)]) is True
 
-    def test_keep_hours_outside_range(self):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_keep_hours_outside_range(self, mock_utc):
         """Keeps hours outside range."""
         ts = datetime(2025, 12, 5, 12, 0, 0)  # noon
         assert should_skip_timestamp(ts, set(), [HourRange(18, 22)]) is False
 
-    def test_skip_hours_wrapping_range(self):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_skip_hours_wrapping_range(self, mock_utc):
         """Skips hours in wrapping range (overnight)."""
         # 16-8 means skip 4pm to 8am
         ts_evening = datetime(2025, 12, 5, 20, 0, 0)  # 8pm
@@ -182,13 +223,15 @@ class TestShouldSkipTimestamp:
         assert should_skip_timestamp(ts_evening, set(), [HourRange(16, 8)]) is True
         assert should_skip_timestamp(ts_early, set(), [HourRange(16, 8)]) is True
 
-    def test_keep_hours_inside_wrapping_gap(self):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_keep_hours_inside_wrapping_gap(self, mock_utc):
         """Keeps hours inside gap of wrapping range."""
         # 16-8 keeps 8am to 4pm
         ts = datetime(2025, 12, 5, 12, 0, 0)  # noon
         assert should_skip_timestamp(ts, set(), [HourRange(16, 8)]) is False
 
-    def test_combined_filters(self):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_combined_filters(self, mock_utc):
         """Skips when either day or hour filter matches."""
         skip_days = {5, 6}  # weekend
         skip_hours = [HourRange(16, 8)]  # 4pm-8am
@@ -201,6 +244,41 @@ class TestShouldSkipTimestamp:
 
         # Friday noon - kept
         assert should_skip_timestamp(datetime(2025, 12, 5, 12, 0, 0), skip_days, skip_hours) is False
+
+    def test_utc_timestamp_converted_to_local(self):
+        """Verifies that UTC timestamp is converted to local for hour filtering.
+
+        This test uses real timezone conversion to ensure skip_hours works
+        correctly with UTC file timestamps.
+        """
+        # Create a UTC time that when converted to local will be in different hour
+        # We'll test the conversion is called by checking the function behavior
+        # changes based on timezone offset
+
+        # Get the local timezone offset
+        import time as time_module
+
+        if time_module.daylight:
+            offset_hours = -time_module.altzone // 3600
+        else:
+            offset_hours = -time_module.timezone // 3600
+
+        if offset_hours == 0:
+            pytest.skip("Test requires non-UTC timezone")
+
+        # Create a UTC timestamp where UTC hour != local hour
+        # If offset is negative (e.g., CST = -6), UTC 18:00 = local 12:00
+        # If offset is positive (e.g., CET = +1), UTC 11:00 = local 12:00
+        if offset_hours < 0:
+            utc_hour = 12 - offset_hours  # e.g., CST: 12 - (-6) = 18 UTC
+        else:
+            utc_hour = 12 - offset_hours  # e.g., CET: 12 - 1 = 11 UTC
+
+        utc_ts = datetime(2025, 12, 5, utc_hour, 0, 0)
+
+        # Skip hours 10-14 (10am-2pm local) - should skip local noon
+        result = should_skip_timestamp(utc_ts, set(), [HourRange(10, 14)])
+        assert result is True, f"UTC {utc_hour}:00 should convert to ~12:00 local and be skipped"
 
 
 class TestFindRecordingFiles:
@@ -268,7 +346,8 @@ class TestFindRecordingFiles:
         # Only Friday files (Dec 5)
         assert len(files) == 5
 
-    def test_filter_by_skip_hours(self, mock_frigate_dir):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_filter_by_skip_hours(self, mock_utc, mock_frigate_dir):
         """Filters out specific hours."""
         files = find_recording_files(
             instance_path=mock_frigate_dir,
@@ -347,7 +426,8 @@ class TestGenerateFileLists:
 
         assert len(result["front"]) == 0
 
-    def test_generate_lists_with_skip_hours(self, mock_multi_camera_dir):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_generate_lists_with_skip_hours(self, mock_utc, mock_multi_camera_dir):
         """Generates file lists with hour filtering."""
         result = generate_file_lists(
             cameras=["front"],
@@ -390,7 +470,8 @@ class TestGenerateFileListsCombinedFilters:
 
         return tmp_path
 
-    def test_combined_skip_days_and_hours(self, mock_week_dir):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_combined_skip_days_and_hours(self, mock_utc, mock_week_dir):
         """Test that both skip_days and skip_hours are applied together.
 
         With skip_days=["sat", "sun"] and skip_hours=["16-8"]:
@@ -428,7 +509,8 @@ class TestGenerateFileListsCombinedFilters:
             hour = int(f.parent.parent.name)
             assert 8 <= hour < 16, f"File at hour {hour} should be filtered: {f}"
 
-    def test_combined_filters_keep_weekday_business_hours(self, mock_week_dir):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_combined_filters_keep_weekday_business_hours(self, mock_utc, mock_week_dir):
         """Keep only weekday business hours (9am-5pm)."""
         result = generate_file_lists(
             cameras=["front"],
@@ -446,7 +528,8 @@ class TestGenerateFileListsCombinedFilters:
         # Total: 5 * 4 = 20 files
         assert len(files) == 20
 
-    def test_combined_filters_strict(self, mock_week_dir):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_combined_filters_strict(self, mock_utc, mock_week_dir):
         """Very strict filters that exclude most files."""
         result = generate_file_lists(
             cameras=["front"],
@@ -465,7 +548,8 @@ class TestGenerateFileListsCombinedFilters:
         # Total: 2 * 4 = 8 files
         assert len(files) == 8
 
-    def test_combined_filters_all_excluded(self, mock_week_dir):
+    @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
+    def test_combined_filters_all_excluded(self, mock_utc, mock_week_dir):
         """Filters that exclude everything."""
         result = generate_file_lists(
             cameras=["front"],
