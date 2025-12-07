@@ -431,28 +431,63 @@ def encode_timelapse(
         cmd = ["ffmpeg", "-y"]
 
         if hwaccel == HWAccel.QSV:
-            # Intel QSV: Use hardware decoding and encoding
-            cmd.extend([
-                "-hwaccel", "qsv",
-                "-hwaccel_output_format", "qsv",
-                "-i", str(input_path),
-                # QSV filter chain: scale for setpts equivalent, then encode
-                "-vf", f"setpts=PTS/{speed}",
-                "-r", str(output_fps),
-                "-c:v", "h264_qsv",
-                "-preset", _qsv_preset(preset),
-                "-global_quality", "23",  # Quality level (lower = better, 18-28 typical)
-            ])
+            # Intel QSV: Full hardware pipeline with frame selection
+            # select filter picks frames on GPU, avoiding CPU transfer for setpts
+            # For speed=N, select every Nth frame: 'not(mod(n,N))'
+            select_expr = f"not(mod(n,{int(speed)}))" if speed >= 2 else None
+            if select_expr:
+                # High speedup: use select filter (processes fewer frames)
+                cmd.extend([
+                    "-hwaccel", "qsv",
+                    "-hwaccel_output_format", "qsv",
+                    "-i", str(input_path),
+                    "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB",
+                    "-r", str(output_fps),
+                    "-c:v", "h264_qsv",
+                    "-preset", _qsv_preset(preset),
+                    "-global_quality", "23",
+                ])
+            else:
+                # Low speedup: use setpts (smoother)
+                cmd.extend([
+                    "-hwaccel", "qsv",
+                    "-hwaccel_output_format", "qsv",
+                    "-i", str(input_path),
+                    "-vf", f"setpts=PTS/{speed}",
+                    "-r", str(output_fps),
+                    "-c:v", "h264_qsv",
+                    "-preset", _qsv_preset(preset),
+                    "-global_quality", "23",
+                ])
         elif hwaccel == HWAccel.VAAPI:
-            # VAAPI: Use hardware encoding with -vaapi_device
-            cmd.extend([
-                "-vaapi_device", "/dev/dri/renderD128",
-                "-i", str(input_path),
-                "-vf", f"setpts=PTS/{speed},format=nv12,hwupload",
-                "-r", str(output_fps),
-                "-c:v", "h264_vaapi",
-                "-qp", "23",  # Quality parameter
-            ])
+            # VAAPI: Full hardware pipeline with frame selection
+            # select filter picks frames on GPU, scale_vaapi processes on GPU
+            select_expr = f"not(mod(n,{int(speed)}))" if speed >= 2 else None
+            if select_expr:
+                # High speedup: use select filter (processes fewer frames)
+                cmd.extend([
+                    "-hwaccel", "vaapi",
+                    "-hwaccel_output_format", "vaapi",
+                    "-hwaccel_device", "/dev/dri/renderD128",
+                    "-i", str(input_path),
+                    "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB,scale_vaapi=format=nv12",
+                    "-r", str(output_fps),
+                    "-c:v", "h264_vaapi",
+                    "-qp", "23",
+                ])
+            else:
+                # Low speedup: use setpts (smoother)
+                cmd.extend([
+                    "-hwaccel", "vaapi",
+                    "-hwaccel_output_format", "vaapi",
+                    "-hwaccel_device", "/dev/dri/renderD128",
+                    "-i", str(input_path),
+                    "-vf", f"setpts=PTS/{speed},scale_vaapi=format=nv12",
+                    "-r", str(output_fps),
+                    "-c:v", "h264_vaapi",
+                    "-qp", "23",
+                ])
+
         else:
             # Software encoding (default)
             cmd.extend([
