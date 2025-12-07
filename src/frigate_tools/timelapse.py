@@ -874,7 +874,7 @@ def encode_frames_to_video(
     output_path: Path,
     fps: float = 30.0,
     preset: str = "fast",
-    crf: int = 23,
+    crf: int = 30,
     progress_callback: Callable[[ProgressInfo], None] | None = None,
     hwaccel: "HWAccel | None" = None,
 ) -> bool:
@@ -885,7 +885,7 @@ def encode_frames_to_video(
         output_path: Output video path
         fps: Output frame rate
         preset: Encoding preset
-        crf: Quality (lower = better, 18-28 typical)
+        crf: Quality (lower = better, 23-30 typical for timelapse)
         progress_callback: Optional callback for progress updates
         hwaccel: Hardware acceleration to use
 
