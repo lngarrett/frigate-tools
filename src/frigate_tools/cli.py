@@ -2,7 +2,8 @@
 
 import atexit
 import re
-from datetime import datetime
+import time as time_module
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -67,6 +68,31 @@ DEFAULT_FRIGATE_PATHS = [
     Path("/var/lib/frigate"),
     Path.home() / "frigate",
 ]
+
+
+def local_to_utc(dt: datetime) -> datetime:
+    """Convert naive local datetime to naive UTC datetime.
+
+    Frigate stores recordings using UTC timestamps in directory structure.
+    User inputs are assumed to be local time and need conversion for file matching.
+
+    Args:
+        dt: Naive datetime in local time
+
+    Returns:
+        Naive datetime in UTC
+    """
+    # Get local timezone offset (accounting for DST)
+    if time_module.daylight and time_module.localtime(dt.timestamp()).tm_isdst > 0:
+        utc_offset = -time_module.altzone
+    else:
+        utc_offset = -time_module.timezone
+
+    # Create timezone-aware local datetime, convert to UTC, return naive
+    local_tz = timezone(timedelta(seconds=utc_offset))
+    local_aware = dt.replace(tzinfo=local_tz)
+    utc_aware = local_aware.astimezone(timezone.utc)
+    return utc_aware.replace(tzinfo=None)
 
 
 def find_frigate_instance() -> Path | None:
@@ -185,7 +211,7 @@ def timelapse_create(
         datetime,
         typer.Option(
             "--start", "-s",
-            help="Start time (ISO format: 2025-12-01T08:00)",
+            help="Start time in local timezone (ISO format: 2025-12-01T08:00)",
             formats=["%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"],
         ),
     ],
@@ -193,7 +219,7 @@ def timelapse_create(
         datetime,
         typer.Option(
             "--end", "-e",
-            help="End time (ISO format: 2025-12-05T16:00)",
+            help="End time in local timezone (ISO format: 2025-12-05T16:00)",
             formats=["%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"],
         ),
     ],
@@ -293,9 +319,13 @@ def timelapse_create(
     skip_days_list = [d.strip() for d in (skip_days or "").split(",") if d.strip()]
     skip_hours_list = [h.strip() for h in (skip_hours or "").split(",") if h.strip()]
 
+    # Convert local time inputs to UTC for file matching (Frigate stores in UTC)
+    start_utc = local_to_utc(start)
+    end_utc = local_to_utc(end)
+
     console.print(f"[bold]Generating timelapse[/bold]")
     console.print(f"  Cameras: {', '.join(camera_list)}")
-    console.print(f"  Time range: {start} to {end}")
+    console.print(f"  Time range: {start} to {end} (local)")
     console.print(f"  Target duration: {duration} ({target_duration}s)")
     if skip_days_list:
         console.print(f"  Skipping days: {', '.join(skip_days_list)}")
@@ -315,8 +345,8 @@ def timelapse_create(
     with console.status("[bold blue]Finding recording files..."):
         file_lists = generate_file_lists(
             cameras=camera_list,
-            start=start,
-            end=end,
+            start=start_utc,
+            end=end_utc,
             instance_path=instance,
             skip_days=skip_days_list if skip_days_list else None,
             skip_hours=skip_hours_list if skip_hours_list else None,
@@ -511,7 +541,7 @@ def clip_create(
         datetime,
         typer.Option(
             "--start", "-s",
-            help="Start time (ISO format: 2025-12-01T12:00)",
+            help="Start time in local timezone (ISO format: 2025-12-01T12:00)",
             formats=["%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"],
         ),
     ],
@@ -526,7 +556,7 @@ def clip_create(
         Optional[datetime],
         typer.Option(
             "--end", "-e",
-            help="End time (ISO format: 2025-12-01T12:05)",
+            help="End time in local timezone (ISO format: 2025-12-01T12:05)",
             formats=["%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"],
         ),
     ] = None,
@@ -632,10 +662,14 @@ def clip_create(
         console.print(f"[red]Error:[/red] Instance path does not exist: {instance}")
         raise typer.Exit(1)
 
+    # Convert local time inputs to UTC for file matching (Frigate stores in UTC)
+    start_utc = local_to_utc(start)
+    end_utc = local_to_utc(end)
+
     # Display info
     console.print(f"[bold]Creating clip[/bold]")
     console.print(f"  Cameras: {', '.join(camera_list)}")
-    console.print(f"  Time range: {start} to {end}")
+    console.print(f"  Time range: {start} to {end} (local)")
     if len(camera_list) > 1:
         console.print(f"  Mode: {'separate files' if separate else 'grid layout'}")
     if reencode:
@@ -667,8 +701,8 @@ def clip_create(
                 success = create_clip(
                     instance_path=instance,
                     camera=camera,
-                    start=start,
-                    end=end,
+                    start=start_utc,
+                    end=end_utc,
                     output_path=output,
                     reencode=reencode,
                     preset=preset,
@@ -680,8 +714,8 @@ def clip_create(
                 success = create_clip(
                     instance_path=instance,
                     camera=camera,
-                    start=start,
-                    end=end,
+                    start=start_utc,
+                    end=end_utc,
                     output_path=output,
                     reencode=reencode,
                     preset=preset,
@@ -706,8 +740,8 @@ def clip_create(
                 result = create_multi_camera_clip(
                     instance_path=instance,
                     cameras=camera_list,
-                    start=start,
-                    end=end,
+                    start=start_utc,
+                    end=end_utc,
                     output_dir=output,
                     separate=True,
                     reencode=reencode,
@@ -729,8 +763,8 @@ def clip_create(
                 result = create_multi_camera_clip(
                     instance_path=instance,
                     cameras=camera_list,
-                    start=start,
-                    end=end,
+                    start=start_utc,
+                    end=end_utc,
                     output_dir=output.parent,
                     separate=False,
                     reencode=reencode,
