@@ -41,7 +41,8 @@ app.add_typer(clip_app, name="clip")
 @app.callback()
 def main_callback() -> None:
     """Frigate Tools - work with Frigate NVR recordings."""
-    init_observability()
+    # Use sync export for CLI to ensure spans are sent before process exits
+    init_observability(sync_export=True)
     atexit.register(shutdown_observability)
 
 
