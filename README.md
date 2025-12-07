@@ -13,13 +13,17 @@ CLI utilities for working with Frigate NVR recordings.
 ## Installation
 
 ```bash
-# From source
+# Clone and setup
 git clone https://github.com/lngarrett/frigate-tools.git
 cd frigate-tools
-pip install -e .
+uv sync
 
-# Or with uv
-uv pip install -e .
+# Run directly (recommended)
+uv run frigate-tools --help
+
+# Or activate the virtual environment
+source .venv/bin/activate
+frigate-tools --help
 ```
 
 ## Usage
@@ -137,8 +141,8 @@ The tool will auto-detect Frigate instances from common paths:
 ## Development
 
 ```bash
-# Install dev dependencies
-uv pip install -e ".[dev]"
+# Sync with dev dependencies
+uv sync --group dev
 
 # Run tests
 uv run pytest
