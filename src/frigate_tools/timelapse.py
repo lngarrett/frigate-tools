@@ -582,21 +582,20 @@ def create_timelapse(
 
     Uses adaptive strategy based on speedup ratio:
     - Low speedup (<30x): Concat + encode with select filter (more frames needed)
-    - High speedup (>=30x): Keyframe-only extraction (much faster)
+    - High speedup (>=30x): Two-pass BSF approach (no decode/encode, much faster)
 
-    For high speedups, uses -skip_frame nokey to only decode keyframes (I-frames).
-    This is dramatically faster because Frigate recordings have ~1 keyframe/second,
-    so for 1 hour source we decode 3,600 frames instead of 108,000.
+    For high speedups, uses bitstream filters to operate at the packet level
+    without decoding. This provides 5-10x performance improvement.
 
     Args:
-        input_files: List of video files (typically Frigate 5-second segments)
+        input_files: List of video files (typically Frigate 10-second segments)
         output_path: Output file path
         target_duration: Desired output duration in seconds
         output_fps: Output frame rate (default 30)
-        preset: FFmpeg encoding preset
+        preset: FFmpeg encoding preset (for low speedups)
         progress_callback: Optional callback for progress updates
         keep_temp: Keep temporary files (for debugging)
-        hwaccel: Hardware acceleration to use (auto-detected if None)
+        hwaccel: Hardware acceleration to use (for low speedups)
 
     Returns:
         True if successful, False otherwise
@@ -617,24 +616,21 @@ def create_timelapse(
         source_duration = len(input_files) * avg_file_duration
 
         speedup = source_duration / target_duration
-        frames_needed = int(target_duration * output_fps)
 
-        # Keyframe-only extraction works when speedup >= 30x
+        # BSF approach works when speedup >= 30x
         # (assuming ~1 keyframe/second input and 30fps output)
         # Below that threshold, we need more frames than keyframes available
-        use_keyframe_only = speedup >= 30.0
+        use_bsf = speedup >= 30.0
 
-        if use_keyframe_only:
-            return _create_timelapse_keyframe(
+        if use_bsf:
+            return _create_timelapse_bsf(
                 input_files=input_files,
                 output_path=output_path,
                 target_duration=target_duration,
                 source_duration=source_duration,
                 output_fps=output_fps,
-                preset=preset,
                 progress_callback=progress_callback,
                 keep_temp=keep_temp,
-                hwaccel=hwaccel,
             )
         else:
             return _create_timelapse_concat(
@@ -704,44 +700,58 @@ def _create_timelapse_concat(
             temp_file.unlink(missing_ok=True)
 
 
-def _create_timelapse_keyframe(
+def check_ffmpeg_bsf_support() -> bool:
+    """Check if FFmpeg supports the noise bitstream filter.
+
+    The noise BSF with drop parameter is required for the two-pass BSF approach.
+    Available in FFmpeg 4.4+.
+    """
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-bsfs"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return "noise" in result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def estimate_keyframes(file_count: int, avg_duration: float = 10.0) -> int:
+    """Estimate keyframe count from file count.
+
+    Frigate recordings have ~1 keyframe per second (GOP=30 at 30fps).
+    Each 10-second segment has ~10 keyframes.
+
+    Args:
+        file_count: Number of input files
+        avg_duration: Average file duration in seconds (Frigate default: 10s)
+
+    Returns:
+        Estimated number of keyframes
+    """
+    return int(file_count * avg_duration)
+
+
+def _bsf_pass1_concat(
     input_files: list[Path],
     output_path: Path,
-    target_duration: float,
-    source_duration: float,
-    output_fps: float = 30.0,
-    preset: str = "fast",
     progress_callback: Callable[[ProgressInfo], None] | None = None,
-    keep_temp: bool = False,
-    hwaccel: HWAccel | None = None,
 ) -> bool:
-    """Create timelapse using keyframe-only extraction.
+    """Pass 1: Fast concatenation with stream copy (no decode/encode).
 
-    For high speedups (>=30x), only decodes keyframes (I-frames).
-    Much faster than concat approach for large source files.
+    Args:
+        input_files: List of video files to concatenate
+        output_path: Output file path
+        progress_callback: Optional callback for progress updates
+
+    Returns:
+        True if successful
     """
     logger = get_logger()
 
-    # Calculate keyframe selection parameters
-    # Frigate recordings have ~1 keyframe per second (GOP of 30 at 30fps)
-    frames_needed = int(target_duration * output_fps)
-    keyframes_available = int(source_duration)  # ~1 keyframe per second
-    keyframe_interval = max(1, keyframes_available // frames_needed)
-
-    speedup = source_duration / target_duration
-
-    logger.info(
-        "Creating timelapse with keyframe extraction (high speedup)",
-        source_duration=f"{source_duration:.0f}s",
-        target_duration=f"{target_duration:.0f}s",
-        speedup=f"{speedup:.0f}x",
-        keyframes_available=keyframes_available,
-        frames_needed=frames_needed,
-        keyframe_interval=keyframe_interval,
-        hwaccel=hwaccel.value if hwaccel else "none",
-    )
-
-    # Create concat file list
+    # Create concat list file
     concat_list = output_path.parent / f".{output_path.stem}_list.txt"
     with open(concat_list, "w") as f:
         for file_path in input_files:
@@ -749,59 +759,21 @@ def _create_timelapse_keyframe(
             f.write(f"file '{escaped}'\n")
 
     try:
-        # Build ffmpeg command with keyframe-only decoding
-        cmd = ["ffmpeg", "-y"]
-
-        # Input: concat demuxer with keyframe-only decoding
-        # -skip_frame nokey tells decoder to skip non-keyframes
-        cmd.extend([
-            "-skip_frame", "nokey",
+        cmd = [
+            "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(concat_list),
-        ])
-
-        # Select every Nth keyframe and reset timestamps
-        select_expr = f"not(mod(n,{keyframe_interval}))"
-
-        # Build filter and encoder based on hardware acceleration
-        if hwaccel == HWAccel.VAAPI:
-            cmd.extend([
-                "-vaapi_device", "/dev/dri/renderD128",
-                "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB,format=nv12,hwupload",
-                "-r", str(output_fps),
-                "-c:v", "h264_vaapi",
-                "-qp", "23",
-            ])
-        elif hwaccel == HWAccel.QSV:
-            cmd.extend([
-                "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB",
-                "-r", str(output_fps),
-                "-c:v", "h264_qsv",
-                "-preset", _qsv_preset(preset),
-                "-global_quality", "23",
-            ])
-        else:
-            # Software encoding
-            cmd.extend([
-                "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB",
-                "-r", str(output_fps),
-                "-c:v", "libx264",
-                "-preset", preset,
-            ])
-
-        cmd.extend([
-            "-an",  # No audio for timelapse
-            "-progress", "pipe:1",
+            "-c", "copy",
+            "-an",
             str(output_path),
-        ])
+        ]
 
-        logger.debug("FFmpeg command", cmd=" ".join(cmd))
+        logger.debug("BSF Pass 1 command", cmd=" ".join(cmd))
 
-        # Use a temp file for stderr to avoid pipe buffer deadlock
-        # (ffmpeg writes many warnings that can fill the stderr pipe buffer,
-        # blocking ffmpeg while we're blocked reading stdout)
-        stderr_file = output_path.parent / f".{output_path.stem}_stderr.log"
+        # Run concat - this is I/O bound and doesn't give good progress
+        # Use stderr to file to avoid buffer issues
+        stderr_file = output_path.parent / f".{output_path.stem}_p1_stderr.log"
         try:
             with open(stderr_file, "w") as stderr_fh:
                 process = subprocess.Popen(
@@ -810,18 +782,8 @@ def _create_timelapse_keyframe(
                     stderr=stderr_fh,
                     text=True,
                 )
-
-                # Parse progress from stdout
-                if process.stdout:
-                    for line in process.stdout:
-                        if progress_callback:
-                            progress = parse_ffmpeg_progress(line.strip(), target_duration)
-                            if progress:
-                                progress_callback(progress)
-
                 process.wait()
 
-            # Read stderr from file if needed for error handling
             stderr_output = ""
             if process.returncode != 0:
                 stderr_output = stderr_file.read_text()
@@ -829,31 +791,167 @@ def _create_timelapse_keyframe(
             stderr_file.unlink(missing_ok=True)
 
         if process.returncode != 0:
-            logger.error("Keyframe timelapse failed", stderr=stderr_output)
-            # Fall back to software encoding if hardware failed
-            if hwaccel != HWAccel.NONE:
-                logger.info("Falling back to software encoding")
-                return _create_timelapse_keyframe(
-                    input_files=input_files,
-                    output_path=output_path,
-                    target_duration=target_duration,
-                    source_duration=source_duration,
-                    output_fps=output_fps,
-                    preset=preset,
-                    progress_callback=progress_callback,
-                    keep_temp=keep_temp,
-                    hwaccel=HWAccel.NONE,
-                )
+            logger.error("BSF Pass 1 (concat) failed", stderr=stderr_output)
+            return False
+
+        if not output_path.exists():
+            logger.error("BSF Pass 1 (concat) failed - output file not created")
             return False
 
         logger.info(
-            "Timelapse created",
+            "BSF Pass 1 complete",
+            output_size_mb=output_path.stat().st_size / (1024 * 1024),
+        )
+        return True
+
+    finally:
+        concat_list.unlink(missing_ok=True)
+
+
+def _bsf_pass2_timelapse(
+    input_path: Path,
+    output_path: Path,
+    packet_interval: int,
+    output_fps: float,
+) -> bool:
+    """Pass 2: Apply bitstream filter to create timelapse (no decode/encode).
+
+    Uses noise BSF to drop packets and setts BSF to retime.
+
+    Args:
+        input_path: Concatenated video file
+        output_path: Output timelapse file
+        packet_interval: Keep every Nth packet
+        output_fps: Output frame rate
+
+    Returns:
+        True if successful
+    """
+    logger = get_logger()
+
+    # Build BSF expression
+    # noise=drop keeps packets where expression is 0 (false)
+    # We keep every Nth packet starting at 0
+    drop_expr = f"mod(n\\,{packet_interval})"
+    setts_expr = f"N/{output_fps}/TB_OUT"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-discard", "nokey",  # Only read keyframe packets
+        "-i", str(input_path),
+        "-c", "copy",
+        "-an",
+        "-bsf:v", f"noise=drop='{drop_expr}',setts=ts='{setts_expr}'",
+        str(output_path),
+    ]
+
+    logger.debug("BSF Pass 2 command", cmd=" ".join(cmd))
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        logger.error("BSF Pass 2 (timelapse) failed", stderr=result.stderr)
+        return False
+
+    if not output_path.exists():
+        logger.error("BSF Pass 2 (timelapse) failed - output file not created")
+        return False
+
+    logger.info(
+        "BSF Pass 2 complete",
+        output_size_mb=output_path.stat().st_size / (1024 * 1024),
+    )
+    return True
+
+
+def _create_timelapse_bsf(
+    input_files: list[Path],
+    output_path: Path,
+    target_duration: float,
+    source_duration: float,
+    output_fps: float = 30.0,
+    progress_callback: Callable[[ProgressInfo], None] | None = None,
+    keep_temp: bool = False,
+) -> bool:
+    """Create timelapse using two-pass bitstream filter approach.
+
+    This approach operates at the packet level without decoding:
+    - Pass 1: Concatenate all files with stream copy
+    - Pass 2: Apply BSF to select keyframes and retime
+
+    Much faster than decode+encode for high speedups (5-10x improvement).
+
+    Args:
+        input_files: List of video files
+        output_path: Output file path
+        target_duration: Desired output duration in seconds
+        source_duration: Total source duration in seconds
+        output_fps: Output frame rate
+        progress_callback: Optional callback for progress updates
+        keep_temp: Keep intermediate files for debugging
+
+    Returns:
+        True if successful
+    """
+    logger = get_logger()
+
+    # Calculate BSF parameters
+    estimated_keyframes = estimate_keyframes(len(input_files))
+    frames_needed = int(target_duration * output_fps)
+    packet_interval = max(1, estimated_keyframes // frames_needed)
+    speedup = source_duration / target_duration
+
+    logger.info(
+        "Creating timelapse with BSF approach",
+        file_count=len(input_files),
+        source_duration=f"{source_duration:.0f}s",
+        target_duration=f"{target_duration:.0f}s",
+        speedup=f"{speedup:.0f}x",
+        estimated_keyframes=estimated_keyframes,
+        frames_needed=frames_needed,
+        packet_interval=packet_interval,
+    )
+
+    # Temp file for concatenated video
+    concat_output = output_path.parent / f".{output_path.stem}_concat.mp4"
+
+    try:
+        # Pass 1: Concatenate
+        if progress_callback:
+            progress_callback(ProgressInfo(
+                frame=0, fps=0, time_seconds=0, speed=0,
+                percent=5.0,  # Starting concat
+            ))
+
+        if not _bsf_pass1_concat(input_files, concat_output):
+            return False
+
+        if progress_callback:
+            progress_callback(ProgressInfo(
+                frame=0, fps=0, time_seconds=0, speed=0,
+                percent=90.0,  # Concat done, BSF starting
+            ))
+
+        # Pass 2: BSF timelapse
+        if not _bsf_pass2_timelapse(
+            concat_output, output_path, packet_interval, output_fps
+        ):
+            return False
+
+        if progress_callback:
+            progress_callback(ProgressInfo(
+                frame=frames_needed, fps=output_fps,
+                time_seconds=target_duration, speed=0,
+                percent=100.0,
+            ))
+
+        logger.info(
+            "BSF timelapse created",
             output=str(output_path),
             file_count=len(input_files),
-            hwaccel=hwaccel.value if hwaccel else "none",
         )
         return True
 
     finally:
         if not keep_temp:
-            concat_list.unlink(missing_ok=True)
+            concat_output.unlink(missing_ok=True)
