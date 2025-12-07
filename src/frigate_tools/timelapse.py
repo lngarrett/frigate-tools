@@ -798,25 +798,35 @@ def _create_timelapse_keyframe(
 
         logger.debug("FFmpeg command", cmd=" ".join(cmd))
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        # Use a temp file for stderr to avoid pipe buffer deadlock
+        # (ffmpeg writes many warnings that can fill the stderr pipe buffer,
+        # blocking ffmpeg while we're blocked reading stdout)
+        stderr_file = output_path.parent / f".{output_path.stem}_stderr.log"
+        try:
+            with open(stderr_file, "w") as stderr_fh:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_fh,
+                    text=True,
+                )
 
-        # Parse progress from stdout
-        stderr_output = ""
-        if process.stdout:
-            for line in process.stdout:
-                if progress_callback:
-                    progress = parse_ffmpeg_progress(line.strip(), target_duration)
-                    if progress:
-                        progress_callback(progress)
+                # Parse progress from stdout
+                if process.stdout:
+                    for line in process.stdout:
+                        if progress_callback:
+                            progress = parse_ffmpeg_progress(line.strip(), target_duration)
+                            if progress:
+                                progress_callback(progress)
 
-        if process.stderr:
-            stderr_output = process.stderr.read()
-        process.wait()
+                process.wait()
+
+            # Read stderr from file if needed for error handling
+            stderr_output = ""
+            if process.returncode != 0:
+                stderr_output = stderr_file.read_text()
+        finally:
+            stderr_file.unlink(missing_ok=True)
 
         if process.returncode != 0:
             logger.error("Keyframe timelapse failed", stderr=stderr_output)
