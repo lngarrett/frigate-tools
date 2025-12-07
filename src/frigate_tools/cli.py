@@ -14,7 +14,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from frigate_tools.clip import create_clip, create_multi_camera_clip, ClipProgress
 from frigate_tools.file_list import generate_file_lists
 from frigate_tools.grid import calculate_grid_layout, create_grid_video, GridProgress
-from frigate_tools.observability import init_observability, shutdown_observability, get_logger
+from frigate_tools.observability import init_observability, shutdown_observability, get_logger, traced_operation
 from frigate_tools.timelapse import (
     create_timelapse,
     encode_timelapse,
@@ -287,6 +287,36 @@ def timelapse_create(
     """
     logger = get_logger()
 
+    with traced_operation(
+        "timelapse_create",
+        {
+            "cameras": cameras,
+            "start": str(start),
+            "end": str(end),
+            "duration": duration,
+            "output": str(output),
+        },
+    ):
+        _timelapse_create_impl(
+            cameras, start, end, duration, output, instance,
+            skip_days, skip_hours, preset, dry_run, logger
+        )
+
+
+def _timelapse_create_impl(
+    cameras: str,
+    start: datetime,
+    end: datetime,
+    duration: str,
+    output: Path,
+    instance: Path | None,
+    skip_days: str | None,
+    skip_hours: str | None,
+    preset: str,
+    dry_run: bool,
+    logger,
+) -> None:
+    """Implementation of timelapse_create command."""
     # Parse duration
     try:
         target_duration = parse_duration(duration)
@@ -622,6 +652,37 @@ def clip_create(
     """
     logger = get_logger()
 
+    with traced_operation(
+        "clip_create",
+        {
+            "cameras": cameras,
+            "start": str(start),
+            "end": str(end) if end else None,
+            "duration": duration,
+            "output": str(output),
+            "separate": separate,
+            "reencode": reencode,
+        },
+    ):
+        _clip_create_impl(
+            cameras, start, end, duration, output, instance,
+            separate, reencode, preset, logger
+        )
+
+
+def _clip_create_impl(
+    cameras: str,
+    start: datetime,
+    end: datetime | None,
+    duration: str | None,
+    output: Path,
+    instance: Path | None,
+    separate: bool,
+    reencode: bool,
+    preset: str,
+    logger,
+) -> None:
+    """Implementation of clip_create command."""
     # Validate end time or duration
     if end is None and duration is None:
         console.print("[red]Error:[/red] Must specify either --end or --duration")
