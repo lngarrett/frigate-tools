@@ -120,6 +120,7 @@ class ProgressInfo:
     time_seconds: float
     speed: float
     percent: float | None = None  # Set when total duration is known
+    total: int | None = None  # Total frames/files for extraction progress
 
 
 def parse_ffmpeg_progress(line: str, total_duration: float | None = None) -> ProgressInfo | None:
@@ -1327,6 +1328,7 @@ def _create_timelapse_frames(
                     time_seconds=0,
                     speed=0,
                     percent=percent,
+                    total=total,
                 ))
 
         frame_files = extract_keyframes_parallel(

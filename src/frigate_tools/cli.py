@@ -468,12 +468,13 @@ def _timelapse_create_impl(
                     # Frame-based: 0-60% extraction, 60-100% encoding
                     # Concat-based: 0-88% concat, 88-100% encoding
                     if info.percent < 60:
-                        # Frame extraction phase
-                        files_done = info.frame if info.frame else int(info.percent / 60 * total_files)
+                        # Frame extraction phase - use actual total from callback if available
+                        actual_total = info.total if info.total else total_files
+                        files_done = info.frame if info.frame else int(info.percent / 60 * actual_total)
                         progress.update(
                             task,
                             completed=info.percent,
-                            description=f"Extracting frames... ({files_done}/{total_files} files)",
+                            description=f"Extracting frames... ({files_done}/{actual_total} files)",
                         )
                     elif info.percent < 95:
                         # Encoding phase
