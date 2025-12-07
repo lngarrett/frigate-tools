@@ -450,12 +450,21 @@ class TestEncodeTimelapse:
 
 
 class TestCreateTimelapse:
-    """Tests for full timelapse creation."""
+    """Tests for full timelapse creation.
+
+    The timelapse function uses adaptive strategy:
+    - Low speedup (<30x): concat + encode approach
+    - High speedup (>=30x): keyframe-only extraction
+    """
 
     @patch("frigate_tools.timelapse.encode_timelapse")
     @patch("frigate_tools.timelapse.concat_files")
-    def test_create_timelapse_two_step_process(self, mock_concat, mock_encode, tmp_path):
-        """Creates timelapse using concat then encode."""
+    @patch("frigate_tools.timelapse.get_video_duration")
+    def test_create_timelapse_low_speedup_uses_concat(
+        self, mock_duration, mock_concat, mock_encode, tmp_path
+    ):
+        """Low speedup (<30x) uses concat + encode approach."""
+        mock_duration.return_value = 5.0  # 5 seconds per file
         mock_concat.return_value = True
         mock_encode.return_value = True
 
@@ -464,6 +473,7 @@ class TestCreateTimelapse:
             f.touch()
 
         output_path = tmp_path / "output.mp4"
+        # 10 seconds source / 60 seconds target = 0.167x speedup (low)
         result = create_timelapse(input_files, output_path, target_duration=60.0)
 
         assert result is True
@@ -471,8 +481,12 @@ class TestCreateTimelapse:
         mock_encode.assert_called_once()
 
     @patch("frigate_tools.timelapse.concat_files")
-    def test_create_timelapse_fails_on_concat_failure(self, mock_concat, tmp_path):
-        """Returns False when concat fails."""
+    @patch("frigate_tools.timelapse.get_video_duration")
+    def test_create_timelapse_fails_on_concat_failure(
+        self, mock_duration, mock_concat, tmp_path
+    ):
+        """Returns False when concat fails (low speedup path)."""
+        mock_duration.return_value = 5.0
         mock_concat.return_value = False
 
         input_files = [tmp_path / "a.mp4"]
@@ -483,8 +497,12 @@ class TestCreateTimelapse:
 
     @patch("frigate_tools.timelapse.encode_timelapse")
     @patch("frigate_tools.timelapse.concat_files")
-    def test_create_timelapse_fails_on_encode_failure(self, mock_concat, mock_encode, tmp_path):
-        """Returns False when encode fails."""
+    @patch("frigate_tools.timelapse.get_video_duration")
+    def test_create_timelapse_fails_on_encode_failure(
+        self, mock_duration, mock_concat, mock_encode, tmp_path
+    ):
+        """Returns False when encode fails (low speedup path)."""
+        mock_duration.return_value = 5.0
         mock_concat.return_value = True
         mock_encode.return_value = False
 
@@ -496,8 +514,12 @@ class TestCreateTimelapse:
 
     @patch("frigate_tools.timelapse.encode_timelapse")
     @patch("frigate_tools.timelapse.concat_files")
-    def test_create_timelapse_cleans_temp_file(self, mock_concat, mock_encode, tmp_path):
+    @patch("frigate_tools.timelapse.get_video_duration")
+    def test_create_timelapse_cleans_temp_file(
+        self, mock_duration, mock_concat, mock_encode, tmp_path
+    ):
         """Removes temporary concat file after completion."""
+        mock_duration.return_value = 5.0
         mock_concat.return_value = True
         mock_encode.return_value = True
 
@@ -513,10 +535,15 @@ class TestCreateTimelapse:
 
     @patch("frigate_tools.timelapse.encode_timelapse")
     @patch("frigate_tools.timelapse.concat_files")
-    def test_create_timelapse_keeps_temp_when_requested(self, mock_concat, mock_encode, tmp_path):
+    @patch("frigate_tools.timelapse.get_video_duration")
+    def test_create_timelapse_keeps_temp_when_requested(
+        self, mock_duration, mock_concat, mock_encode, tmp_path
+    ):
         """Keeps temp file when keep_temp=True."""
+        mock_duration.return_value = 5.0
+
         # Create actual temp file to test preservation
-        def create_temp(files, output):
+        def create_temp(files, output, *args, **kwargs):
             output.touch()
             return True
 
@@ -531,6 +558,40 @@ class TestCreateTimelapse:
 
         # When keep_temp=True, we don't delete, but the mock creates the file
         # at a different path, so this test mainly verifies the flag is passed
+
+    @patch("subprocess.Popen")
+    @patch("frigate_tools.timelapse.get_video_duration")
+    @patch("frigate_tools.timelapse.get_hwaccel")
+    def test_create_timelapse_high_speedup_uses_keyframe(
+        self, mock_hwaccel, mock_duration, mock_popen, tmp_path
+    ):
+        """High speedup (>=30x) uses keyframe-only extraction."""
+        mock_hwaccel.return_value = HWAccel.NONE
+        mock_duration.return_value = 5.0  # 5 seconds per file
+
+        # Mock successful ffmpeg process
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+        mock_process.stdout = iter([])
+        mock_process.stderr = MagicMock()
+        mock_process.stderr.read.return_value = ""
+        mock_popen.return_value = mock_process
+
+        # 200 files * 5 sec = 1000 sec source, target 15 sec = 66x speedup (high)
+        input_files = [tmp_path / f"{i}.mp4" for i in range(200)]
+        for f in input_files:
+            f.touch()
+
+        output_path = tmp_path / "output.mp4"
+        result = create_timelapse(input_files, output_path, target_duration=15.0)
+
+        assert result is True
+        # Should use keyframe path (calls subprocess.Popen directly, not concat_files)
+        mock_popen.assert_called_once()
+        # Verify -skip_frame nokey is in the command
+        call_args = mock_popen.call_args[0][0]
+        assert "-skip_frame" in call_args
+        assert "nokey" in call_args
 
 
 @pytest.mark.skipif(not ffmpeg_available(), reason="ffmpeg not available")

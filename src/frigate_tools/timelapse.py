@@ -1,10 +1,11 @@
 """Single camera timelapse encoding.
 
-Two-step approach:
-1. Concat input files with -c copy to temp file (fast, no re-encoding)
-2. Encode with setpts filter to create timelapse
+Keyframe extraction approach:
+1. Calculate which timestamps/files contain the frames we need
+2. Extract keyframes directly from source files (no concat)
+3. Encode extracted frames to output
 
-Uses setpts filter with frame dropping for efficient timelapse creation.
+Uses -skip_frame nokey for efficient keyframe-only decoding.
 Supports hardware acceleration (Intel QSV, VAAPI) when available.
 """
 
@@ -571,6 +572,7 @@ def create_timelapse(
     input_files: list[Path],
     output_path: Path,
     target_duration: float,
+    output_fps: float = 30.0,
     preset: str = "fast",
     progress_callback: Callable[[ProgressInfo], None] | None = None,
     keep_temp: bool = False,
@@ -578,17 +580,22 @@ def create_timelapse(
 ) -> bool:
     """Create a timelapse video from input files.
 
-    Two-step process:
-    1. Concatenate all input files (fast, no re-encoding)
-    2. Encode with speed adjustment to target duration
+    Uses adaptive strategy based on speedup ratio:
+    - Low speedup (<30x): Concat + encode with select filter (more frames needed)
+    - High speedup (>=30x): Keyframe-only extraction (much faster)
+
+    For high speedups, uses -skip_frame nokey to only decode keyframes (I-frames).
+    This is dramatically faster because Frigate recordings have ~1 keyframe/second,
+    so for 1 hour source we decode 3,600 frames instead of 108,000.
 
     Args:
-        input_files: List of video files
+        input_files: List of video files (typically Frigate 5-second segments)
         output_path: Output file path
         target_duration: Desired output duration in seconds
+        output_fps: Output frame rate (default 30)
         preset: FFmpeg encoding preset
         progress_callback: Optional callback for progress updates
-        keep_temp: Keep temporary concatenated file (for debugging)
+        keep_temp: Keep temporary files (for debugging)
         hwaccel: Hardware acceleration to use (auto-detected if None)
 
     Returns:
@@ -596,37 +603,247 @@ def create_timelapse(
     """
     logger = get_logger()
 
+    if hwaccel is None:
+        hwaccel = get_hwaccel()
+
     with traced_operation(
         "create_timelapse",
         {"file_count": len(input_files), "target_duration": target_duration},
     ):
-        # Create temp file for concatenated video
-        temp_dir = output_path.parent
-        temp_file = temp_dir / f".{output_path.stem}_concat.mp4"
+        # Get actual source duration by sampling files
+        sample_count = min(5, len(input_files))
+        sample_durations = [get_video_duration(f) for f in input_files[:sample_count]]
+        avg_file_duration = sum(sample_durations) / len(sample_durations) if sample_durations else 5.0
+        source_duration = len(input_files) * avg_file_duration
 
-        try:
-            # Step 1: Concatenate
-            if not concat_files(input_files, temp_file):
-                return False
+        speedup = source_duration / target_duration
+        frames_needed = int(target_duration * output_fps)
 
-            # Step 2: Encode with timelapse effect
-            if not encode_timelapse(
-                temp_file,
-                output_path,
-                target_duration,
+        # Keyframe-only extraction works when speedup >= 30x
+        # (assuming ~1 keyframe/second input and 30fps output)
+        # Below that threshold, we need more frames than keyframes available
+        use_keyframe_only = speedup >= 30.0
+
+        if use_keyframe_only:
+            return _create_timelapse_keyframe(
+                input_files=input_files,
+                output_path=output_path,
+                target_duration=target_duration,
+                source_duration=source_duration,
+                output_fps=output_fps,
                 preset=preset,
                 progress_callback=progress_callback,
+                keep_temp=keep_temp,
                 hwaccel=hwaccel,
-            ):
-                return False
-
-            logger.info(
-                "Timelapse created",
-                output=str(output_path),
-                file_count=len(input_files),
             )
-            return True
+        else:
+            return _create_timelapse_concat(
+                input_files=input_files,
+                output_path=output_path,
+                target_duration=target_duration,
+                preset=preset,
+                progress_callback=progress_callback,
+                keep_temp=keep_temp,
+                hwaccel=hwaccel,
+            )
 
-        finally:
-            if not keep_temp:
-                temp_file.unlink(missing_ok=True)
+
+def _create_timelapse_concat(
+    input_files: list[Path],
+    output_path: Path,
+    target_duration: float,
+    preset: str = "fast",
+    progress_callback: Callable[[ProgressInfo], None] | None = None,
+    keep_temp: bool = False,
+    hwaccel: HWAccel | None = None,
+) -> bool:
+    """Create timelapse using concat + encode approach.
+
+    For lower speedups where we need more frames than keyframes available.
+    Two-step process:
+    1. Concatenate all input files (fast, -c copy)
+    2. Encode with select filter to target duration
+    """
+    logger = get_logger()
+
+    logger.info(
+        "Creating timelapse with concat approach (low speedup)",
+        file_count=len(input_files),
+        target_duration=f"{target_duration:.0f}s",
+        hwaccel=hwaccel.value if hwaccel else "none",
+    )
+
+    # Create temp file for concatenated video
+    temp_file = output_path.parent / f".{output_path.stem}_concat.mp4"
+
+    try:
+        # Step 1: Concatenate
+        if not concat_files(input_files, temp_file):
+            return False
+
+        # Step 2: Encode with timelapse effect
+        if not encode_timelapse(
+            temp_file,
+            output_path,
+            target_duration,
+            preset=preset,
+            progress_callback=progress_callback,
+            hwaccel=hwaccel,
+        ):
+            return False
+
+        logger.info(
+            "Timelapse created",
+            output=str(output_path),
+            file_count=len(input_files),
+        )
+        return True
+
+    finally:
+        if not keep_temp:
+            temp_file.unlink(missing_ok=True)
+
+
+def _create_timelapse_keyframe(
+    input_files: list[Path],
+    output_path: Path,
+    target_duration: float,
+    source_duration: float,
+    output_fps: float = 30.0,
+    preset: str = "fast",
+    progress_callback: Callable[[ProgressInfo], None] | None = None,
+    keep_temp: bool = False,
+    hwaccel: HWAccel | None = None,
+) -> bool:
+    """Create timelapse using keyframe-only extraction.
+
+    For high speedups (>=30x), only decodes keyframes (I-frames).
+    Much faster than concat approach for large source files.
+    """
+    logger = get_logger()
+
+    # Calculate keyframe selection parameters
+    # Frigate recordings have ~1 keyframe per second (GOP of 30 at 30fps)
+    frames_needed = int(target_duration * output_fps)
+    keyframes_available = int(source_duration)  # ~1 keyframe per second
+    keyframe_interval = max(1, keyframes_available // frames_needed)
+
+    speedup = source_duration / target_duration
+
+    logger.info(
+        "Creating timelapse with keyframe extraction (high speedup)",
+        source_duration=f"{source_duration:.0f}s",
+        target_duration=f"{target_duration:.0f}s",
+        speedup=f"{speedup:.0f}x",
+        keyframes_available=keyframes_available,
+        frames_needed=frames_needed,
+        keyframe_interval=keyframe_interval,
+        hwaccel=hwaccel.value if hwaccel else "none",
+    )
+
+    # Create concat file list
+    concat_list = output_path.parent / f".{output_path.stem}_list.txt"
+    with open(concat_list, "w") as f:
+        for file_path in input_files:
+            escaped = str(file_path.resolve()).replace("'", "'\\''")
+            f.write(f"file '{escaped}'\n")
+
+    try:
+        # Build ffmpeg command with keyframe-only decoding
+        cmd = ["ffmpeg", "-y"]
+
+        # Input: concat demuxer with keyframe-only decoding
+        # -skip_frame nokey tells decoder to skip non-keyframes
+        cmd.extend([
+            "-skip_frame", "nokey",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_list),
+        ])
+
+        # Select every Nth keyframe and reset timestamps
+        select_expr = f"not(mod(n,{keyframe_interval}))"
+
+        # Build filter and encoder based on hardware acceleration
+        if hwaccel == HWAccel.VAAPI:
+            cmd.extend([
+                "-vaapi_device", "/dev/dri/renderD128",
+                "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB,format=nv12,hwupload",
+                "-r", str(output_fps),
+                "-c:v", "h264_vaapi",
+                "-qp", "23",
+            ])
+        elif hwaccel == HWAccel.QSV:
+            cmd.extend([
+                "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB",
+                "-r", str(output_fps),
+                "-c:v", "h264_qsv",
+                "-preset", _qsv_preset(preset),
+                "-global_quality", "23",
+            ])
+        else:
+            # Software encoding
+            cmd.extend([
+                "-vf", f"select='{select_expr}',setpts=N/FRAME_RATE/TB",
+                "-r", str(output_fps),
+                "-c:v", "libx264",
+                "-preset", preset,
+            ])
+
+        cmd.extend([
+            "-an",  # No audio for timelapse
+            "-progress", "pipe:1",
+            str(output_path),
+        ])
+
+        logger.debug("FFmpeg command", cmd=" ".join(cmd))
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Parse progress from stdout
+        stderr_output = ""
+        if process.stdout:
+            for line in process.stdout:
+                if progress_callback:
+                    progress = parse_ffmpeg_progress(line.strip(), target_duration)
+                    if progress:
+                        progress_callback(progress)
+
+        if process.stderr:
+            stderr_output = process.stderr.read()
+        process.wait()
+
+        if process.returncode != 0:
+            logger.error("Keyframe timelapse failed", stderr=stderr_output)
+            # Fall back to software encoding if hardware failed
+            if hwaccel != HWAccel.NONE:
+                logger.info("Falling back to software encoding")
+                return _create_timelapse_keyframe(
+                    input_files=input_files,
+                    output_path=output_path,
+                    target_duration=target_duration,
+                    source_duration=source_duration,
+                    output_fps=output_fps,
+                    preset=preset,
+                    progress_callback=progress_callback,
+                    keep_temp=keep_temp,
+                    hwaccel=HWAccel.NONE,
+                )
+            return False
+
+        logger.info(
+            "Timelapse created",
+            output=str(output_path),
+            file_count=len(input_files),
+            hwaccel=hwaccel.value if hwaccel else "none",
+        )
+        return True
+
+    finally:
+        if not keep_temp:
+            concat_list.unlink(missing_ok=True)
