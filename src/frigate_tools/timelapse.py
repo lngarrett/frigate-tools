@@ -749,7 +749,15 @@ def _bsf_pass1_concat(
     Returns:
         True if successful
     """
+    import time
+
     logger = get_logger()
+
+    # Estimate expected output size for progress reporting
+    # Sample first few files to get average size
+    sample_sizes = [f.stat().st_size for f in input_files[:min(5, len(input_files))]]
+    avg_file_size = sum(sample_sizes) / len(sample_sizes) if sample_sizes else 10 * 1024 * 1024
+    expected_size = len(input_files) * avg_file_size
 
     # Create concat list file
     concat_list = output_path.parent / f".{output_path.stem}_list.txt"
@@ -771,8 +779,7 @@ def _bsf_pass1_concat(
 
         logger.debug("BSF Pass 1 command", cmd=" ".join(cmd))
 
-        # Run concat - this is I/O bound and doesn't give good progress
-        # Use stderr to file to avoid buffer issues
+        # Run concat with progress monitoring via output file size
         stderr_file = output_path.parent / f".{output_path.stem}_p1_stderr.log"
         try:
             with open(stderr_file, "w") as stderr_fh:
@@ -782,7 +789,30 @@ def _bsf_pass1_concat(
                     stderr=stderr_fh,
                     text=True,
                 )
-                process.wait()
+
+                # Monitor progress by checking output file size
+                # Progress range: 5% to 85% (leave room for Pass 2)
+                last_report_time = time.time()
+                while process.poll() is None:
+                    time.sleep(2)  # Check every 2 seconds
+
+                    if progress_callback and output_path.exists():
+                        current_size = output_path.stat().st_size
+                        # Scale progress: 5% to 85%
+                        size_ratio = min(1.0, current_size / expected_size)
+                        percent = 5 + (size_ratio * 80)
+
+                        # Calculate estimated files processed
+                        files_processed = int(size_ratio * len(input_files))
+
+                        progress_callback(ProgressInfo(
+                            frame=files_processed,
+                            fps=0,
+                            time_seconds=0,
+                            speed=0,
+                            percent=percent,
+                        ))
+                        last_report_time = time.time()
 
             stderr_output = ""
             if process.returncode != 0:
@@ -916,20 +946,15 @@ def _create_timelapse_bsf(
     concat_output = output_path.parent / f".{output_path.stem}_concat.mp4"
 
     try:
-        # Pass 1: Concatenate
-        if progress_callback:
-            progress_callback(ProgressInfo(
-                frame=0, fps=0, time_seconds=0, speed=0,
-                percent=5.0,  # Starting concat
-            ))
-
-        if not _bsf_pass1_concat(input_files, concat_output):
+        # Pass 1: Concatenate (with progress monitoring)
+        if not _bsf_pass1_concat(input_files, concat_output, progress_callback):
             return False
 
+        # Signal Pass 1 complete, Pass 2 starting
         if progress_callback:
             progress_callback(ProgressInfo(
-                frame=0, fps=0, time_seconds=0, speed=0,
-                percent=90.0,  # Concat done, BSF starting
+                frame=len(input_files), fps=0, time_seconds=0, speed=0,
+                percent=88.0,  # Concat done, BSF starting
             ))
 
         # Pass 2: BSF timelapse
