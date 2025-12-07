@@ -12,7 +12,9 @@ from frigate_tools.timelapse import (
     ProgressInfo,
     concat_files,
     create_timelapse,
+    encode_frames_to_video,
     encode_timelapse,
+    extract_keyframes_parallel,
     get_video_duration,
     parse_ffmpeg_progress,
 )
@@ -559,49 +561,42 @@ class TestCreateTimelapse:
         # When keep_temp=True, we don't delete, but the mock creates the file
         # at a different path, so this test mainly verifies the flag is passed
 
-    @patch("subprocess.run")
-    @patch("subprocess.Popen")
+    @patch("frigate_tools.timelapse.encode_frames_to_video")
+    @patch("frigate_tools.timelapse.extract_keyframes_parallel")
     @patch("frigate_tools.timelapse.get_video_duration")
     @patch("frigate_tools.timelapse.get_hwaccel")
-    def test_create_timelapse_high_speedup_uses_bsf(
-        self, mock_hwaccel, mock_duration, mock_popen, mock_run, tmp_path
+    def test_create_timelapse_high_speedup_uses_frames(
+        self, mock_hwaccel, mock_duration, mock_extract, mock_encode, tmp_path
     ):
-        """High speedup (>=30x) uses BSF approach (two-pass, no decode)."""
+        """High speedup (>=30x) uses frame extraction approach (parallel, no concat)."""
         mock_hwaccel.return_value = HWAccel.NONE
-        mock_duration.return_value = 5.0  # 5 seconds per file
+        mock_duration.return_value = 10.0  # 10 seconds per file (typical Frigate)
 
-        # Mock successful ffmpeg Popen for Pass 1 (concat)
-        mock_process = MagicMock()
-        mock_process.returncode = 0
-        mock_process.wait.return_value = 0
-        mock_popen.return_value = mock_process
+        # Mock frame extraction returning some frame paths
+        frame_dir = tmp_path / "frames"
+        frame_dir.mkdir()
+        mock_frames = [frame_dir / f"frame_{i:04d}.jpg" for i in range(100)]
+        for f in mock_frames:
+            f.touch()
+        mock_extract.return_value = mock_frames
 
-        # Mock successful ffmpeg run for Pass 2 (BSF)
-        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        # Mock encoding success
+        mock_encode.return_value = True
 
-        # 200 files * 5 sec = 1000 sec source, target 15 sec = 66x speedup (high)
+        # 200 files * 10 sec = 2000 sec source, target 15 sec = 133x speedup (high)
         input_files = [tmp_path / f"{i}.mp4" for i in range(200)]
         for f in input_files:
             f.touch()
 
         output_path = tmp_path / "output.mp4"
-        # Create the concat output file that Pass 1 would create
-        concat_output = tmp_path / ".output_concat.mp4"
-        concat_output.write_bytes(b"fake video content")
-        # Create the final output file that Pass 2 would create
-        output_path.write_bytes(b"fake timelapse content")
 
         result = create_timelapse(input_files, output_path, target_duration=15.0)
 
         assert result is True
-        # Pass 1: Popen for concat
-        mock_popen.assert_called_once()
-        # Pass 2: run for BSF - should have -discard nokey and -bsf:v
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args[0][0]
-        assert "-discard" in call_args
-        assert "nokey" in call_args
-        assert "-bsf:v" in call_args
+        # Frame extraction should be called
+        mock_extract.assert_called_once()
+        # Encoding should be called with the extracted frames
+        mock_encode.assert_called_once()
 
 
 @pytest.mark.skipif(not ffmpeg_available(), reason="ffmpeg not available")

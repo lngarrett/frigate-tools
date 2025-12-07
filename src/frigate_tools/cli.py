@@ -465,20 +465,22 @@ def _timelapse_create_impl(
             def update_progress(info: ProgressInfo) -> None:
                 if info.percent is not None:
                     # Update description based on phase
-                    if info.percent < 88:
-                        # Pass 1: Concatenating
-                        files_done = info.frame if info.frame else int((info.percent - 5) / 80 * total_files)
+                    # Frame-based: 0-60% extraction, 60-100% encoding
+                    # Concat-based: 0-88% concat, 88-100% encoding
+                    if info.percent < 60:
+                        # Frame extraction phase
+                        files_done = info.frame if info.frame else int(info.percent / 60 * total_files)
                         progress.update(
                             task,
                             completed=info.percent,
-                            description=f"Concatenating... ({files_done}/{total_files} files)",
+                            description=f"Extracting frames... ({files_done}/{total_files} files)",
                         )
                     elif info.percent < 95:
-                        # Pass 2: BSF
+                        # Encoding phase
                         progress.update(
                             task,
                             completed=info.percent,
-                            description="Applying timelapse filter...",
+                            description="Encoding video...",
                         )
                     else:
                         progress.update(
