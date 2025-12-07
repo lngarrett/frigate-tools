@@ -22,28 +22,29 @@ class TestHourRange:
     """Tests for HourRange class."""
 
     def test_normal_range_contains(self):
-        """Normal range like 9-17 contains hours within bounds."""
+        """Normal range like 9-17 contains hours within bounds (inclusive)."""
         r = HourRange(9, 17)
         assert r.contains(9) is True
         assert r.contains(12) is True
         assert r.contains(16) is True
-        assert r.contains(17) is False  # end is exclusive
+        assert r.contains(17) is True  # end is inclusive
         assert r.contains(8) is False
         assert r.contains(18) is False
 
     def test_wrapping_range_contains(self):
-        """Wrapping range like 16-8 spans midnight."""
+        """Wrapping range like 16-8 spans midnight (inclusive on both ends)."""
         r = HourRange(16, 8)
         # After 16:00
         assert r.contains(16) is True
         assert r.contains(20) is True
         assert r.contains(23) is True
-        # Before 08:00
+        # Before 08:00 (end hour is inclusive)
         assert r.contains(0) is True
         assert r.contains(5) is True
         assert r.contains(7) is True
+        assert r.contains(8) is True  # end is inclusive
         # Outside range
-        assert r.contains(8) is False
+        assert r.contains(9) is False
         assert r.contains(12) is False
         assert r.contains(15) is False
 
@@ -354,13 +355,13 @@ class TestFindRecordingFiles:
             camera="front",
             start=datetime(2025, 12, 5, 0, 0, 0),
             end=datetime(2025, 12, 7, 0, 0, 0),
-            skip_hours=[HourRange(16, 8)],  # Skip 4pm to 8am (keep 8am-4pm)
+            skip_hours=[HourRange(16, 8)],  # Skip 4pm to 8am inclusive (keep 9am-3pm)
         )
-        # Only files from 8am-4pm:
-        # Dec 5: 08:00, 08:30, 12:00, 12:30 (4 files)
+        # Only files from 9am-3pm (hour 8 is now skipped with inclusive end):
+        # Dec 5: 12:00, 12:30 (2 files) - 08:xx now skipped
         # Dec 6: 10:00, 10:30 (2 files)
         # Dec 5 20:00 is skipped (8pm)
-        assert len(files) == 6
+        assert len(files) == 4
 
     def test_nonexistent_camera(self, mock_frigate_dir):
         """Returns empty list for nonexistent camera."""
@@ -476,7 +477,7 @@ class TestGenerateFileListsCombinedFilters:
 
         With skip_days=["sat", "sun"] and skip_hours=["16-8"]:
         - Excludes all Saturday (Dec 6) and Sunday (Dec 7) files
-        - Excludes 6am, 6pm, 10pm files (outside 8am-4pm)
+        - Excludes 6am, 8am, 6pm, 10pm files (outside 9am-3pm)
         - Keeps only Mon-Fri 10am and 12pm files
         """
         result = generate_file_lists(
@@ -485,7 +486,7 @@ class TestGenerateFileListsCombinedFilters:
             end=datetime(2025, 12, 8, 0, 0, 0),
             instance_path=mock_week_dir,
             skip_days=["sat", "sun"],  # Skip weekend
-            skip_hours=["16-8"],  # Skip 4pm to 8am (keep 8am-4pm)
+            skip_hours=["16-8"],  # Skip 4pm to 8am inclusive (keep 9am-3pm)
         )
 
         files = result["front"]
@@ -502,12 +503,12 @@ class TestGenerateFileListsCombinedFilters:
             assert "2025-12-06" not in path_str  # Saturday
             assert "2025-12-07" not in path_str  # Sunday
 
-        # Verify only 8am-4pm files (10 and 12 hour directories)
+        # Verify only 9am-3pm files (10 and 12 hour directories)
         # Path structure: recordings/YYYY-MM-DD/HH/camera/MM.SS.mp4
         for f in files:
             # Extract hour from path: parent is camera, parent.parent is hour
             hour = int(f.parent.parent.name)
-            assert 8 <= hour < 16, f"File at hour {hour} should be filtered: {f}"
+            assert 9 <= hour < 16, f"File at hour {hour} should be filtered: {f}"
 
     @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
     def test_combined_filters_keep_weekday_business_hours(self, mock_utc, mock_week_dir):
@@ -537,16 +538,16 @@ class TestGenerateFileListsCombinedFilters:
             end=datetime(2025, 12, 8, 0, 0, 0),
             instance_path=mock_week_dir,
             skip_days=["mon", "tue", "wed", "thu", "fri"],  # Skip all weekdays
-            skip_hours=["18-10"],  # Skip 6pm to 10am
+            skip_hours=["18-10"],  # Skip 6pm to 10am inclusive
         )
 
         files = result["front"]
 
-        # Only Sat/Sun, only 10am-6pm
+        # Only Sat/Sun, only 11am-5pm (10am is now skipped with inclusive end)
         # Sat+Sun = 2 days
-        # Per day: 10am (2) + 12pm (2) = 4 files
-        # Total: 2 * 4 = 8 files
-        assert len(files) == 8
+        # Per day: 12pm (2) = 2 files (10am is skipped with inclusive end)
+        # Total: 2 * 2 = 4 files
+        assert len(files) == 4
 
     @patch("frigate_tools.file_list.utc_to_local", side_effect=lambda x: x)
     def test_combined_filters_all_excluded(self, mock_utc, mock_week_dir):

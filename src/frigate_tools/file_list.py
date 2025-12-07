@@ -44,13 +44,13 @@ class HourRange:
     end: int  # 0-23
 
     def contains(self, hour: int) -> bool:
-        """Check if hour falls within this skip range."""
+        """Check if hour falls within this skip range (inclusive on both ends)."""
         if self.start <= self.end:
-            # Normal range like 9-17
-            return self.start <= hour < self.end
+            # Normal range like 9-17 means skip hours 9 through 17 inclusive
+            return self.start <= hour <= self.end
         else:
-            # Wrapping range like 16-8 (skip 4pm to 8am)
-            return hour >= self.start or hour < self.end
+            # Wrapping range like 22-6 (skip 10pm to 6am inclusive)
+            return hour >= self.start or hour <= self.end
 
 
 def parse_skip_days(skip_days: list[str]) -> set[int]:
