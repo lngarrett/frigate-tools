@@ -336,18 +336,19 @@ def _concat_batch(
     try:
         cmd = [
             "ffmpeg",
+            "-nostdin",  # Prevent ffmpeg from reading stdin (messes up terminal)
             "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(concat_file_list_path),
             "-c", "copy",
         ]
-        
+
         # Add progress output if callback provided (only if re-encoding, copy doesn't give good progress)
         # For concat -c copy, ffmpeg doesn't output reliable progress updates via pipe:1
         # if progress_callback:
         #     cmd.extend(["-progress", "pipe:1"])
-            
+
         cmd.append(str(output_path))
         
         # Calculate total input size for logging and potential future progress estimation
@@ -437,7 +438,7 @@ def encode_timelapse(
         )
 
         # Build command based on hardware acceleration type
-        cmd = ["ffmpeg", "-y"]
+        cmd = ["ffmpeg", "-nostdin", "-y"]
 
         if hwaccel == HWAccel.QSV:
             # Intel QSV: Full hardware pipeline with frame selection
@@ -766,7 +767,7 @@ def _extract_frames_worker(args: tuple) -> tuple[str, list[str], str | None]:
             # Extract all keyframes from file
             output_pattern = f"{output_dir}/{file_index:06d}_%04d.jpg"
             cmd = [
-                "ffmpeg", "-y",
+                "ffmpeg", "-nostdin", "-y",
                 "-skip_frame", "nokey",
                 "-i", file_path,
                 "-vsync", "vfr",
@@ -777,7 +778,7 @@ def _extract_frames_worker(args: tuple) -> tuple[str, list[str], str | None]:
             # Extract just first frame (always a keyframe)
             output_file = f"{output_dir}/{file_index:06d}_0001.jpg"
             cmd = [
-                "ffmpeg", "-y",
+                "ffmpeg", "-nostdin", "-y",
                 "-i", file_path,
                 "-vframes", "1",
                 "-update", "1",
@@ -910,7 +911,7 @@ def encode_frames_to_video(
         expected_duration = len(frame_files) / fps
 
         # Build ffmpeg command
-        cmd = ["ffmpeg", "-y"]
+        cmd = ["ffmpeg", "-nostdin", "-y"]
 
         # Add hardware acceleration if available
         if hwaccel == HWAccel.QSV:
@@ -1024,7 +1025,7 @@ def _bsf_pass1_concat(
 
     try:
         cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg", "-nostdin", "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", str(concat_list),
@@ -1122,7 +1123,7 @@ def _bsf_pass2_timelapse(
     setts_expr = f"N/{output_fps}/TB_OUT"
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-nostdin", "-y",
         "-discard", "nokey",  # Only read keyframe packets
         "-i", str(input_path),
         "-c", "copy",
