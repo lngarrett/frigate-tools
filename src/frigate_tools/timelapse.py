@@ -1287,14 +1287,17 @@ def _create_timelapse_frames(
 
     # For very high speedups, sample files to reduce work
     if not extract_all and frames_needed < len(input_files):
-        # Sample every Nth file
-        file_interval = max(1, len(input_files) // frames_needed)
-        sampled_files = input_files[::file_interval][:frames_needed]
+        # Sample evenly across entire time range
+        # This ensures we cover from first to last file, not just the first N
+        n_files = len(input_files)
+        indices = [int(i * (n_files - 1) / (frames_needed - 1)) for i in range(frames_needed)]
+        sampled_files = [input_files[i] for i in indices]
         logger.info(
             "High speedup: sampling files",
             original_files=len(input_files),
             sampled_files=len(sampled_files),
-            file_interval=file_interval,
+            first_idx=indices[0],
+            last_idx=indices[-1],
         )
         files_to_process = sampled_files
     else:
